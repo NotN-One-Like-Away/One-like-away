@@ -1,0 +1,252 @@
+name: RI - PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  RI_PROVIDER: ${{ vars.RI_PROVIDER || 'groq' }}
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD | head -c 12000)
+          {
+            echo "diff<<DIFF_EOF"
+            echo "$DIFF"
+            echo "DIFF_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Get changed files
+        id: files
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | head -50 | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Run AI Review
+        id: review
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGED_FILES: ${{ steps.files.outputs.files }}
+          DIFF_CONTENT: ${{ steps.diff.outputs.diff }}
+        run: |
+          # Determine API endpoint and key based on provider
+          case "$RI_PROVIDER" in
+            groq)
+              API_URL="https://api.groq.com/openai/v1/chat/completions"
+              API_KEY="$GROQ_API_KEY"
+              MODEL="${GROQ_MODEL:-llama-3.3-70b-versatile}"
+              AUTH_HEADER="Authorization: Bearer $API_KEY"
+              ;;
+            openai)
+              API_URL="https://api.openai.com/v1/chat/completions"
+              API_KEY="$OPENAI_API_KEY"
+              MODEL="${OPENAI_MODEL:-gpt-4o}"
+              AUTH_HEADER="Authorization: Bearer $API_KEY"
+              ;;
+            anthropic)
+              API_URL="https://api.anthropic.com/v1/messages"
+              API_KEY="$ANTHROPIC_API_KEY"
+              MODEL="${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}"
+              AUTH_HEADER="x-api-key: $API_KEY"
+              ;;
+            together)
+              API_URL="https://api.together.xyz/v1/chat/completions"
+              API_KEY="$TOGETHER_API_KEY"
+              MODEL="${TOGETHER_MODEL:-meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo}"
+              AUTH_HEADER="Authorization: Bearer $API_KEY"
+              ;;
+            openrouter)
+              API_URL="https://openrouter.ai/api/v1/chat/completions"
+              API_KEY="$OPENROUTER_API_KEY"
+              MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}"
+              AUTH_HEADER="Authorization: Bearer $API_KEY"
+              ;;
+            *)
+              echo "Unknown provider: $RI_PROVIDER"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$API_KEY" ]; then
+            echo "API key not set for provider $RI_PROVIDER"
+            echo "review={\"error\": \"API key not configured\"}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build the prompt using jq to safely handle special characters
+          PROMPT=$(jq -n -r \
+            --arg pr_title "$PR_TITLE" \
+            --arg pr_body "$PR_BODY" \
+            --arg files "$CHANGED_FILES" \
+            --arg diff "$DIFF_CONTENT" \
+            '"You are an expert code reviewer. Analyze this PR and provide a structured review.
+
+          Output ONLY valid JSON (no markdown, no explanation):
+          {
+            \"summary\": \"2-3 sentence summary of changes\",
+            \"risk_level\": \"low|medium|high|critical\",
+            \"review_action\": \"APPROVE|REQUEST_CHANGES|COMMENT\",
+            \"feedback\": [
+              {
+                \"file\": \"path/to/file\",
+                \"line\": 42,
+                \"type\": \"issue|suggestion|praise|nitpick\",
+                \"severity\": \"critical|warning|info\",
+                \"message\": \"Feedback message\",
+                \"suggestion\": \"Optional: suggested code fix\"
+              }
+            ],
+            \"tests_needed\": [\"Test descriptions if tests are missing\"],
+            \"security_concerns\": [\"Any security issues found\"]
+          }
+
+          PR Title: \($pr_title)
+          PR Description: \($pr_body)
+          Changed files: \($files)
+
+          Diff:
+          \($diff)"')
+
+          # Call the API
+          if [ "$RI_PROVIDER" = "anthropic" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "$AUTH_HEADER" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{"error": "API call failed with HTTP '"$HTTP_CODE"'"}'
+            fi
+            REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // .error // "{\"error\": \"Parse failed\"}"')
+          else
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "$AUTH_HEADER" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.1}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{"error": "API call failed with HTTP '"$HTTP_CODE"'"}'
+            fi
+            REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // .error // "{\"error\": \"Parse failed\"}"')
+          fi
+
+          # Output the review
+          {
+            echo "review<<REVIEW_EOF"
+            echo "$REVIEW"
+            echo "REVIEW_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Submit GitHub Review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reviewText = process.env.REVIEW || '{}';
+            let review;
+
+            try {
+              // Try to extract JSON from potential markdown code blocks
+              const jsonMatch = reviewText.match(/\{[\s\S]*\}/);
+              review = JSON.parse(jsonMatch ? jsonMatch[0] : reviewText);
+            } catch (e) {
+              console.log('Failed to parse review JSON:', e.message);
+              review = { error: 'Parse failed', raw: reviewText };
+            }
+
+            if (review.error) {
+              console.log('Review generation failed:', review.error);
+              return;
+            }
+
+            // Build review body
+            let body = `## AI Code Review\n\n`;
+            body += `**Risk Level:** ${review.risk_level === 'critical' ? '🔴' : review.risk_level === 'high' ? '🟠' : review.risk_level === 'medium' ? '🟡' : '🟢'} ${review.risk_level}\n\n`;
+            body += `### Summary\n${review.summary}\n\n`;
+
+            if (review.feedback && review.feedback.length > 0) {
+              body += `### Feedback\n\n`;
+              for (const item of review.feedback) {
+                const icon = item.type === 'issue' ? '⚠️' : item.type === 'praise' ? '✅' : item.type === 'nitpick' ? '💅' : '💡';
+                const severity = item.severity === 'critical' ? '**CRITICAL**' : item.severity === 'warning' ? '**Warning**' : '';
+                body += `${icon} ${severity} **${item.file}${item.line ? `:${item.line}` : ''}**\n`;
+                body += `${item.message}\n`;
+                if (item.suggestion) {
+                  body += `\n\`\`\`suggestion\n${item.suggestion}\n\`\`\`\n`;
+                }
+                body += '\n';
+              }
+            }
+
+            if (review.security_concerns && review.security_concerns.length > 0) {
+              body += `### 🔒 Security Concerns\n`;
+              review.security_concerns.forEach(s => body += `- ${s}\n`);
+              body += '\n';
+            }
+
+            if (review.tests_needed && review.tests_needed.length > 0) {
+              body += `### 🧪 Tests Needed\n`;
+              review.tests_needed.forEach(t => body += `- [ ] ${t}\n`);
+              body += '\n';
+            }
+
+            body += `\n---\n*Generated by [Repo Intelligence](https://github.com/anthropics/repo-intelligence)*`;
+
+            // Map review action to GitHub event
+            const eventMap = {
+              'APPROVE': 'APPROVE',
+              'REQUEST_CHANGES': 'REQUEST_CHANGES',
+              'COMMENT': 'COMMENT'
+            };
+            const event = eventMap[review.review_action] || 'COMMENT';
+
+            // Submit as a proper GitHub PR review
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: body,
+                event: event
+              });
+              console.log(`Submitted ${event} review`);
+            } catch (e) {
+              console.log('Failed to submit review, posting as comment:', e.message);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+        env:
+          REVIEW: ${{ steps.review.outputs.review }}

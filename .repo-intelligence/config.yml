@@ -1,0 +1,183 @@
+# Repo Intelligence Configuration
+# Copy to .repo-intelligence/config.yml in your project
+
+version: "1"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKFLOWS - Enable/disable specific automation
+# ═══════════════════════════════════════════════════════════════════════════════
+workflows:
+  review-pr: true           # AI-powered PR reviews
+  detect-adr: true          # Detect architectural decisions
+  log-impact: true          # Log impact of merged changes
+  update-documentation: true # Suggest documentation updates
+  update-diagrams: false    # Generate architecture diagrams (opt-in)
+  write-tests: true         # Generate test specifications
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTPUTS - Where generated content goes
+# ═══════════════════════════════════════════════════════════════════════════════
+outputs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Documentation Output
+  # ─────────────────────────────────────────────────────────────────────────────
+  documentation:
+    # Mode options:
+    #   local  - Write to local docs folder (default)
+    #   readme - Update a section in README.md
+    #   remote - Push to a documentation server
+    #   multi  - Multiple destinations
+    mode: local
+
+    # For mode: local
+    local_path: docs
+
+    # For mode: readme
+    # readme_path: README.md
+    # readme_section: "## API Documentation"  # Section to update
+
+    # For mode: remote (push to central docs server)
+    # remote:
+    #   url: https://docs.yourcompany.com
+    #   auth_type: bearer          # none, bearer, basic, api_key
+    #   auth_env_var: DOCS_TOKEN   # Env var containing the token
+    #   endpoint: /api/docs/upload
+
+    # For mode: multi (multiple destinations)
+    # destinations:
+    #   - type: local
+    #     config:
+    #       path: docs
+    #   - type: readme
+    #     config:
+    #       path: README.md
+    #       section: "## Docs"
+    #   - type: remote
+    #     config:
+    #       url: https://docs.example.com
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Test Intent Output
+  # ─────────────────────────────────────────────────────────────────────────────
+  tests:
+    # Mode options:
+    #   separate  - Dedicated folder for all test intents (default)
+    #   alongside - Next to source files
+    #   custom    - Specify your own path pattern
+    mode: separate
+
+    # For mode: separate
+    separate_path: .ri/test-intents
+
+    # For mode: alongside
+    # Creates: src/auth.ts -> src/auth.test-intent.json
+    # alongside_suffix: .test-intent.json
+
+    # For mode: custom
+    # Use {file} for filename, {dir} for directory
+    # Example: tests/intents/{dir}/{file}.intent.json
+    # custom_path: tests/intents/{dir}/{file}.intent.json
+
+    # Experimental: Also generate actual test code
+    generate_code: false
+    # code_framework: jest  # jest, pytest, go, vitest, etc.
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ADR (Architecture Decision Records) Output
+  # ─────────────────────────────────────────────────────────────────────────────
+  adr:
+    path: docs/adr
+    # Filename format: {number} = padded number, {slug} = slugified title
+    filename_format: "ADR-{number}-{slug}.md"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Impact Log Output
+  # ─────────────────────────────────────────────────────────────────────────────
+  impact:
+    path: docs/impact
+    formats:
+      - json      # Machine-readable
+      - markdown  # Human-readable
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Diagram Output
+  # ─────────────────────────────────────────────────────────────────────────────
+  diagrams:
+    path: docs/diagrams
+    format: mermaid  # mermaid, plantuml, both
+    embed_in_readme: false  # Also add main diagram to README
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROVIDER - AI backend for analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+provider:
+  # Available providers:
+  #   ollama     - Local, free, requires decent hardware
+  #   groq       - Cloud, free tier (30 req/min), fast
+  #   together   - Cloud, free credits on signup
+  #   openrouter - Cloud, access to many models (some free)
+  #   anthropic  - Cloud, paid (Claude)
+  #   openai     - Cloud, paid (GPT)
+  name: groq
+
+  # Provider-specific settings (uncomment the one you use)
+
+  # Ollama (local) - requires: ollama running locally
+  # ollama:
+  #   host: http://localhost:11434
+  #   model: llama3  # or: codellama, mistral, deepseek-coder
+
+  # Groq (free cloud) - requires: GROQ_API_KEY env var
+  # Get free key at: https://console.groq.com
+  groq:
+    model: llama-3.3-70b-versatile  # or: llama-3.1-8b-instant (faster)
+
+  # Together.ai (free credits) - requires: TOGETHER_API_KEY env var
+  # together:
+  #   model: meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo
+
+  # OpenRouter (multi-model) - requires: OPENROUTER_API_KEY env var
+  # openrouter:
+  #   model: meta-llama/llama-3.1-70b-instruct:free
+
+  # Anthropic (paid) - requires: ANTHROPIC_API_KEY env var
+  # anthropic:
+  #   model: claude-3-5-sonnet-20241022
+
+  # OpenAI (paid) - requires: OPENAI_API_KEY env var
+  # openai:
+  #   model: gpt-4o
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCE - Where your code lives
+# ═══════════════════════════════════════════════════════════════════════════════
+source:
+  paths:
+    - src
+    - lib
+  ignore:
+    - node_modules
+    - __pycache__
+    - .git
+    - dist
+    - build
+    - coverage
+    - "*.min.js"
+    - "*.generated.*"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETTINGS - General behavior
+# ═══════════════════════════════════════════════════════════════════════════════
+settings:
+  # Minimum confidence (0-1) to create an ADR
+  adr_confidence_threshold: 0.7
+
+  # Automatically commit generated files
+  auto_commit: false
+
+  # Post analysis comments on PRs
+  comment_on_pr: true
+
+  # Preview mode - show what would happen without writing files
+  dry_run: false

@@ -1,0 +1,518 @@
+name: RI - ADR Detection
+
+# Customize branches by editing this file or using workflow_dispatch
+# To add/remove branches: edit the branches list below
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+      - develop
+      - staging
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+      - master
+      - dev
+      - develop
+      - staging
+  # Manual trigger with custom branch
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to analyze'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RI_PROVIDER: ${{ vars.RI_PROVIDER || 'groq' }}
+  ADR_PATH: ${{ vars.RI_ADR_PATH || 'docs/adr' }}
+
+jobs:
+  detect-adr:
+    name: Detect Architectural Decisions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin ${{ github.base_ref }}
+            BASE="origin/${{ github.base_ref }}"
+            HEAD="HEAD"
+          else
+            # For push events, compare with parent commit
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+
+            if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+              # New branch, compare with parent
+              BASE="${HEAD}^"
+            fi
+          fi
+
+          DIFF=$(git diff ${BASE}...${HEAD} | head -c 12000)
+          FILES=$(git diff --name-only ${BASE}...${HEAD} | head -50 | tr '\n' ' ')
+
+          {
+            echo "diff<<DIFF_EOF"
+            echo "$DIFF"
+            echo "DIFF_EOF"
+          } >> $GITHUB_OUTPUT
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Detect architectural decisions
+        id: detect
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+          DIFF_CONTENT: ${{ steps.changes.outputs.diff }}
+        run: |
+          case "$RI_PROVIDER" in
+            groq)
+              API_URL="https://api.groq.com/openai/v1/chat/completions"
+              API_KEY="$GROQ_API_KEY"
+              MODEL="${GROQ_MODEL:-llama-3.3-70b-versatile}"
+              ;;
+            openai)
+              API_URL="https://api.openai.com/v1/chat/completions"
+              API_KEY="$OPENAI_API_KEY"
+              MODEL="${OPENAI_MODEL:-gpt-4o}"
+              ;;
+            anthropic)
+              API_URL="https://api.anthropic.com/v1/messages"
+              API_KEY="$ANTHROPIC_API_KEY"
+              MODEL="${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}"
+              ;;
+            together)
+              API_URL="https://api.together.xyz/v1/chat/completions"
+              API_KEY="$TOGETHER_API_KEY"
+              MODEL="${TOGETHER_MODEL:-meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo}"
+              ;;
+            openrouter)
+              API_URL="https://openrouter.ai/api/v1/chat/completions"
+              API_KEY="$OPENROUTER_API_KEY"
+              MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}"
+              ;;
+          esac
+
+          if [ -z "$API_KEY" ]; then
+            echo "API key not set for provider $RI_PROVIDER"
+            echo "result={\"decisions\": []}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PROMPT=$(jq -n -r \
+            --arg branch "$BRANCH_NAME" \
+            --arg event "$EVENT_NAME" \
+            --arg files "$CHANGED_FILES" \
+            --arg diff "$DIFF_CONTENT" \
+            '"Analyze this code change for ARCHITECTURAL DECISIONS. An architectural decision is:
+          - A choice about system structure, patterns, or technology
+          - Something that affects multiple components or is hard to reverse
+          - NOT a simple bug fix, style change, or minor refactor
+
+          Output ONLY valid JSON:
+          {
+            \"decisions\": [
+              {
+                \"confidence\": 0.85,
+                \"title\": \"Short descriptive title\",
+                \"context\": \"Why this decision was needed\",
+                \"decision\": \"What was decided\",
+                \"consequences\": {
+                  \"positive\": [\"Benefits\"],
+                  \"negative\": [\"Drawbacks\"],
+                  \"risks\": [\"Potential risks\"]
+                },
+                \"alternatives\": [
+                  {\"option\": \"Alternative approach\", \"reason_rejected\": \"Why not chosen\"}
+                ],
+                \"files_involved\": [\"affected/files.ts\"]
+              }
+            ],
+            \"no_decisions_reason\": \"Only if decisions array is empty\"
+          }
+
+          Branch: \($branch)
+          Event: \($event)
+          Changed files: \($files)
+
+          Diff:
+          \($diff)"')
+
+          if [ "$RI_PROVIDER" = "anthropic" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "x-api-key: $API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{"decisions": []}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "{\"decisions\": []}"')
+          else
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.1}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{"decisions": []}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "{\"decisions\": []}"')
+          fi
+
+          {
+            echo "result<<RESULT_EOF"
+            echo "$RESULT"
+            echo "RESULT_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Process ADR detection
+        id: process
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultText = process.env.RESULT || '{}';
+            let result;
+
+            try {
+              const jsonMatch = resultText.match(/\{[\s\S]*\}/);
+              result = JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
+            } catch (e) {
+              console.log('Failed to parse result:', e.message);
+              core.setOutput('has_decisions', 'false');
+              return;
+            }
+
+            if (!result.decisions || result.decisions.length === 0) {
+              console.log('No architectural decisions detected');
+              if (result.no_decisions_reason) {
+                console.log('Reason:', result.no_decisions_reason);
+              }
+              core.setOutput('has_decisions', 'false');
+              return;
+            }
+
+            // Filter by confidence threshold (0.7)
+            const validDecisions = result.decisions.filter(d => d.confidence >= 0.7);
+
+            if (validDecisions.length === 0) {
+              console.log('No decisions above confidence threshold');
+              core.setOutput('has_decisions', 'false');
+              return;
+            }
+
+            core.setOutput('has_decisions', 'true');
+            core.setOutput('decisions', JSON.stringify(validDecisions));
+            core.setOutput('count', validDecisions.length.toString());
+        env:
+          RESULT: ${{ steps.detect.outputs.result }}
+
+      - name: Create ADR files
+        if: steps.process.outputs.has_decisions == 'true'
+        id: create_adrs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const decisions = JSON.parse(process.env.DECISIONS || '[]');
+            const adrPath = process.env.ADR_PATH;
+            const isPR = '${{ github.event_name }}' === 'pull_request';
+            const refName = '${{ github.ref_name }}';
+            const createdAdrs = [];
+
+            // Get next ADR number
+            let nextNum = 1;
+            try {
+              const { data: contents } = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: adrPath
+              });
+
+              const adrFiles = contents.filter(f => f.name.match(/^ADR-\d+/));
+              if (adrFiles.length > 0) {
+                const nums = adrFiles.map(f => parseInt(f.name.match(/ADR-(\d+)/)[1]));
+                nextNum = Math.max(...nums) + 1;
+              }
+            } catch (e) {
+              console.log('ADR directory does not exist yet, starting at 0001');
+            }
+
+            for (const decision of decisions) {
+              const adrId = `ADR-${String(nextNum).padStart(4, '0')}`;
+              const slug = decision.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 50);
+              const filename = `${adrPath}/${adrId}-${slug}.md`;
+
+              // Build markdown content (avoid template literals with ## to prevent YAML issues)
+              const lines = [
+                '# ' + adrId + ': ' + decision.title,
+                '',
+                '## Status',
+                'Proposed',
+                '',
+                '## Context',
+                decision.context,
+                '',
+                '## Decision',
+                decision.decision,
+                '',
+                '## Consequences',
+                '',
+                '### Positive',
+                decision.consequences.positive.map(p => '- ' + p).join('\n'),
+                '',
+                '### Negative',
+                decision.consequences.negative.map(n => '- ' + n).join('\n'),
+                '',
+                '### Risks',
+                (decision.consequences.risks || []).map(r => '- ' + r).join('\n') || '- None identified',
+                '',
+                '## Alternatives Considered',
+                decision.alternatives.map(a => '- **' + a.option + '**: ' + a.reason_rejected).join('\n'),
+                '',
+                '## Files Involved',
+                decision.files_involved.map(f => '- `' + f + '`').join('\n'),
+                '',
+                '---',
+                '*Detected on branch `' + refName + '` with ' + Math.round(decision.confidence * 100) + '% confidence*',
+                '*Generated by Repo Intelligence*'
+              ];
+              const content = lines.join('\n');
+
+              createdAdrs.push({
+                id: adrId,
+                title: decision.title,
+                file: filename,
+                content: content,
+                confidence: decision.confidence
+              });
+              nextNum++;
+            }
+
+            core.setOutput('adrs', JSON.stringify(createdAdrs));
+        env:
+          DECISIONS: ${{ steps.process.outputs.decisions }}
+          ADR_PATH: ${{ env.ADR_PATH }}
+
+      - name: Update architecture diagram
+        if: steps.process.outputs.has_decisions == 'true'
+        id: update_diagram
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DETECTED_DECISIONS: ${{ steps.process.outputs.decisions }}
+        run: |
+          DIAGRAM_PATH="${{ vars.RI_DIAGRAM_PATH || 'docs/architecture' }}"
+          DIAGRAM_FILE="$DIAGRAM_PATH/ARCHITECTURE.md"
+
+          # Get current diagram if exists
+          CURRENT_DIAGRAM=""
+          if [ -f "$DIAGRAM_FILE" ]; then
+            CURRENT_DIAGRAM=$(cat "$DIAGRAM_FILE" | head -200)
+          fi
+
+          # Determine API settings
+          case "$RI_PROVIDER" in
+            groq) API_URL="https://api.groq.com/openai/v1/chat/completions"; API_KEY="$GROQ_API_KEY"; MODEL="${GROQ_MODEL:-llama-3.3-70b-versatile}" ;;
+            openai) API_URL="https://api.openai.com/v1/chat/completions"; API_KEY="$OPENAI_API_KEY"; MODEL="${OPENAI_MODEL:-gpt-4o}" ;;
+            anthropic) API_URL="https://api.anthropic.com/v1/messages"; API_KEY="$ANTHROPIC_API_KEY"; MODEL="${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}" ;;
+            together) API_URL="https://api.together.xyz/v1/chat/completions"; API_KEY="$TOGETHER_API_KEY"; MODEL="${TOGETHER_MODEL:-meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo}" ;;
+            openrouter) API_URL="https://openrouter.ai/api/v1/chat/completions"; API_KEY="$OPENROUTER_API_KEY"; MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}" ;;
+          esac
+
+          if [ -z "$API_KEY" ]; then
+            echo "has_update=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PROMPT=$(jq -n -r \
+            --arg diagram "$CURRENT_DIAGRAM" \
+            --arg decisions "$DETECTED_DECISIONS" \
+            '"Update the architecture diagram to reflect the detected architectural changes.
+
+          CURRENT DIAGRAM:
+          \($diagram)
+
+          DETECTED ARCHITECTURAL DECISIONS:
+          \($decisions)
+
+          OUTPUT: Return ONLY valid JSON:
+          {
+            \"title\": \"Architecture Overview\",
+            \"description\": \"Brief description\",
+            \"diagrams\": [
+              {\"name\": \"system-overview\", \"type\": \"flowchart\", \"description\": \"desc\", \"mermaid\": \"flowchart TB...\"}
+            ],
+            \"changes_made\": [\"List of what changed in the diagram\"]
+          }"')
+
+          if [ "$RI_PROVIDER" = "anthropic" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "x-api-key: $API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "{}"')
+          else
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.1}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "{}"')
+          fi
+
+          # Try to parse and create diagram file
+          mkdir -p "$DIAGRAM_PATH"
+
+          JSON_CONTENT=$(echo "$RESULT" | grep -o '{.*}' | head -1 || echo "")
+          if [ -n "$JSON_CONTENT" ] && echo "$JSON_CONTENT" | jq . >/dev/null 2>&1; then
+            TITLE=$(echo "$JSON_CONTENT" | jq -r '.title // "Architecture Overview"')
+            DESC=$(echo "$JSON_CONTENT" | jq -r '.description // "System architecture"')
+
+            {
+              echo "# $TITLE"
+              echo ""
+              echo "$DESC"
+              echo ""
+              echo "---"
+              echo ""
+              echo "$JSON_CONTENT" | jq -r '.diagrams[]? | "## \(.name)\n\n\(.description)\n\n```mermaid\n\(.mermaid)\n```\n"' 2>/dev/null
+              echo ""
+              echo "---"
+              echo ""
+              echo "*Last updated: $(date +%Y-%m-%d) (automated)*"
+              echo "*Trigger: Architectural changes detected*"
+              echo "*Generated by Repo Intelligence*"
+            } > "$DIAGRAM_FILE"
+
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "diagram_file=$DIAGRAM_FILE" >> $GITHUB_OUTPUT
+            CHANGES=$(echo "$JSON_CONTENT" | jq -r '.changes_made[]? // empty' 2>/dev/null | head -5 | tr '\n' ';')
+            echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+          else
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit ADRs and diagrams (push event)
+        if: steps.process.outputs.has_decisions == 'true' && github.event_name == 'push'
+        env:
+          ADR_DATA: ${{ steps.create_adrs.outputs.adrs }}
+        run: |
+          ADR_PATH="${{ env.ADR_PATH }}"
+          DIAGRAM_PATH="${{ vars.RI_DIAGRAM_PATH || 'docs/architecture' }}"
+          mkdir -p "$ADR_PATH"
+
+          # Parse and write ADR files
+          echo "$ADR_DATA" | jq -r '.[] | @base64' | while read adr; do
+            FILE=$(echo "$adr" | base64 -d | jq -r '.file')
+            CONTENT=$(echo "$adr" | base64 -d | jq -r '.content')
+            echo "$CONTENT" > "$FILE"
+          done
+
+          git config user.name "repo-intelligence[bot]"
+          git config user.email "repo-intelligence[bot]@users.noreply.github.com"
+          git add "$ADR_PATH"/*.md 2>/dev/null || true
+          git add "$DIAGRAM_PATH"/*.md 2>/dev/null || true
+          git commit -m "docs: Auto-detected architectural decisions and updated diagrams
+
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}" || echo "No changes to commit"
+          git push || echo "Push failed"
+
+      - name: Comment on PR (PR event)
+        if: steps.process.outputs.has_decisions == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const adrs = JSON.parse(process.env.ADRS || '[]');
+            const hasUpdate = process.env.HAS_DIAGRAM_UPDATE === 'true';
+            const diagramChanges = process.env.DIAGRAM_CHANGES || '';
+
+            let body = '## 🏗️ Architectural Decisions Detected\n\n';
+            body += 'This PR appears to contain **' + adrs.length + '** architectural decision(s):\n\n';
+
+            for (const adr of adrs) {
+              const confidence = Math.round(adr.confidence * 100);
+              body += '### ' + adr.id + ': ' + adr.title + '\n';
+              body += '- **Confidence:** ' + confidence + '%\n';
+              body += '- **Proposed file:** `' + adr.file + '`\n\n';
+              body += '<details><summary>View ADR Content</summary>\n\n';
+              body += '```markdown\n' + adr.content + '\n```\n';
+              body += '</details>\n\n';
+            }
+
+            if (hasUpdate) {
+              body += '### 📊 Architecture Diagram Update\n\n';
+              body += 'The architecture diagram will be updated when this PR is merged.\n';
+              if (diagramChanges) {
+                body += '\n**Changes:**\n';
+                diagramChanges.split(';').filter(c => c).forEach(c => {
+                  body += '- ' + c + '\n';
+                });
+              }
+              body += '\n';
+            }
+
+            body += '### 📝 What to do\n';
+            body += '1. Review the detected decisions for accuracy\n';
+            body += '2. If correct, the ADR files will be created when this PR is merged\n';
+            body += '3. Update the ADR status from "Proposed" to "Accepted" after team review\n\n';
+            body += '---\n*Generated by [Repo Intelligence](https://github.com/anthropics/repo-intelligence)*';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+        env:
+          ADRS: ${{ steps.create_adrs.outputs.adrs }}
+          HAS_DIAGRAM_UPDATE: ${{ steps.update_diagram.outputs.has_update }}
+          DIAGRAM_CHANGES: ${{ steps.update_diagram.outputs.changes }}

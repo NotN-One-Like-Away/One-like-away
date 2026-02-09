@@ -1,0 +1,332 @@
+name: RI - Generate Test Intents
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RI_PROVIDER: ${{ vars.RI_PROVIDER || 'groq' }}
+
+jobs:
+  generate-tests:
+    name: Generate Test Specifications
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Get merged changes
+        id: changes
+        run: |
+          # Get the merge commit
+          MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+
+          # Get changed source files from the PR
+          CHANGED=$(git diff --name-only ${MERGE_SHA}^...${MERGE_SHA} | grep -E '\.(ts|tsx|js|jsx|py|go|rs|java|rb|php)$' | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '__tests__' | head -20 || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No source files changed"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          {
+            echo "files<<FILES_EOF"
+            echo "$CHANGED"
+            echo "FILES_EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Get the diff for changed files
+          DIFF=$(git diff ${MERGE_SHA}^...${MERGE_SHA} -- $CHANGED | head -c 12000)
+          {
+            echo "diff<<DIFF_EOF"
+            echo "$DIFF"
+            echo "DIFF_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Generate test intents
+        if: steps.changes.outputs.has_changes == 'true'
+        id: generate
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+          DIFF_CONTENT: ${{ steps.changes.outputs.diff }}
+        run: |
+          # Determine API endpoint and key based on provider
+          case "$RI_PROVIDER" in
+            groq)
+              API_URL="https://api.groq.com/openai/v1/chat/completions"
+              API_KEY="$GROQ_API_KEY"
+              MODEL="${GROQ_MODEL:-llama-3.3-70b-versatile}"
+              ;;
+            openai)
+              API_URL="https://api.openai.com/v1/chat/completions"
+              API_KEY="$OPENAI_API_KEY"
+              MODEL="${OPENAI_MODEL:-gpt-4o}"
+              ;;
+            anthropic)
+              API_URL="https://api.anthropic.com/v1/messages"
+              API_KEY="$ANTHROPIC_API_KEY"
+              MODEL="${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}"
+              ;;
+            together)
+              API_URL="https://api.together.xyz/v1/chat/completions"
+              API_KEY="$TOGETHER_API_KEY"
+              MODEL="${TOGETHER_MODEL:-meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo}"
+              ;;
+            openrouter)
+              API_URL="https://openrouter.ai/api/v1/chat/completions"
+              API_KEY="$OPENROUTER_API_KEY"
+              MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}"
+              ;;
+          esac
+
+          if [ -z "$API_KEY" ]; then
+            echo "API key not set for provider $RI_PROVIDER"
+            echo "result={}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PROMPT=$(jq -n -r \
+            --arg files "$CHANGED_FILES" \
+            --arg diff "$DIFF_CONTENT" \
+            '"Analyze this code and generate test specifications. Output language-independent test INTENTS.
+
+          Output ONLY valid JSON:
+          {
+            \"test_files\": [
+              {
+                \"target_file\": \"src/example.ts\",
+                \"test_type\": \"unit|integration|e2e\",
+                \"test_cases\": [
+                  {
+                    \"name\": \"should_do_something\",
+                    \"intent\": \"What this test verifies\",
+                    \"category\": \"happy_path|edge_case|error_handling|security\",
+                    \"given\": \"Initial state/preconditions\",
+                    \"when\": \"Action being tested\",
+                    \"then\": \"Expected outcome\",
+                    \"priority\": \"critical|high|medium|low\"
+                  }
+                ],
+                \"mocking_needed\": [\"Dependencies that need mocking\"]
+              }
+            ]
+          }
+
+          Changed files:
+          \($files)
+
+          Code diff:
+          \($diff)"')
+
+          if [ "$RI_PROVIDER" = "anthropic" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "x-api-key: $API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "{}"')
+          else
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.1}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "{}"')
+          fi
+
+          {
+            echo "result<<RESULT_EOF"
+            echo "$RESULT"
+            echo "RESULT_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create test intents PR
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultText = process.env.RESULT || '{}';
+            let result;
+
+            try {
+              const jsonMatch = resultText.match(/\{[\s\S]*\}/);
+              result = JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
+            } catch (e) {
+              console.log('Failed to parse result:', e.message);
+              return;
+            }
+
+            if (!result.test_files || result.test_files.length === 0) {
+              console.log('No test intents generated');
+              return;
+            }
+
+            const intentsPath = '.ri/test-intents';
+            const prNumber = ${{ github.event.pull_request.number }};
+            const branchName = `ri/test-intents-pr-${prNumber}`;
+
+            // Create branch
+            const baseSha = '${{ github.event.pull_request.merge_commit_sha }}';
+
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/heads/${branchName}`,
+                sha: baseSha
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+              // Branch exists, update it
+              await github.rest.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${branchName}`,
+                sha: baseSha,
+                force: true
+              });
+            }
+
+            // Create test intent files
+            const filesToCreate = [];
+            for (const testFile of result.test_files) {
+              const targetBasename = path.basename(testFile.target_file, path.extname(testFile.target_file));
+              const intentFilename = `${intentsPath}/${targetBasename}.test-intent.json`;
+
+              const intent = {
+                target: { file: testFile.target_file, type: testFile.test_type },
+                test_cases: testFile.test_cases,
+                mocking_needed: testFile.mocking_needed || [],
+                metadata: {
+                  generated_at: new Date().toISOString(),
+                  source_pr: prNumber
+                }
+              };
+
+              filesToCreate.push({
+                path: intentFilename,
+                content: JSON.stringify(intent, null, 2)
+              });
+            }
+
+            // Create files via GitHub API
+            for (const file of filesToCreate) {
+              const content = Buffer.from(file.content).toString('base64');
+
+              try {
+                // Check if file exists
+                const { data: existing } = await github.rest.repos.getContent({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  path: file.path,
+                  ref: branchName
+                });
+
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  path: file.path,
+                  message: `test: add test intent for ${path.basename(file.path)}`,
+                  content: content,
+                  branch: branchName,
+                  sha: existing.sha
+                });
+              } catch (e) {
+                if (e.status === 404) {
+                  await github.rest.repos.createOrUpdateFileContents({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    path: file.path,
+                    message: `test: add test intent for ${path.basename(file.path)}`,
+                    content: content,
+                    branch: branchName
+                  });
+                } else {
+                  throw e;
+                }
+              }
+            }
+
+            // Create PR
+            let prBody = `## Test Intent Specifications\n\n`;
+            prBody += `This PR contains AI-generated test specifications for PR #${prNumber}.\n\n`;
+            prBody += `### Generated Test Intents\n\n`;
+
+            let totalTests = 0;
+            for (const tf of result.test_files) {
+              prBody += `#### ${tf.target_file}\n`;
+              prBody += `- Type: ${tf.test_type}\n`;
+              prBody += `- Test cases: ${tf.test_cases.length}\n\n`;
+
+              prBody += `| Test | Category | Priority |\n`;
+              prBody += `|------|----------|----------|\n`;
+              for (const tc of tf.test_cases.slice(0, 10)) {
+                const priority = tc.priority === 'critical' ? '🔴' : tc.priority === 'high' ? '🟠' : tc.priority === 'medium' ? '🟡' : '🟢';
+                prBody += `| ${tc.name} | ${tc.category} | ${priority} |\n`;
+                totalTests++;
+              }
+              prBody += '\n';
+            }
+
+            prBody += `### Next Steps\n`;
+            prBody += `1. **Review** these test specifications for accuracy\n`;
+            prBody += `2. **Implement** actual tests based on these intents\n`;
+            prBody += `3. **Merge** this PR to track test coverage\n\n`;
+            prBody += `---\n*Generated by [Repo Intelligence](https://github.com/anthropics/repo-intelligence)*`;
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `test: Add test intents from PR #${prNumber}`,
+              body: prBody,
+              head: branchName,
+              base: '${{ github.event.pull_request.base.ref }}'
+            });
+
+            console.log(`Created PR #${pr.number}: ${pr.html_url}`);
+
+            // Add label
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['test-intents', 'automated']
+              });
+            } catch (e) {
+              console.log('Could not add labels:', e.message);
+            }
+        env:
+          RESULT: ${{ steps.generate.outputs.result }}

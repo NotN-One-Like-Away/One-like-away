@@ -1,0 +1,318 @@
+name: RI - Log Impact
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+env:
+  RI_PROVIDER: ${{ vars.RI_PROVIDER || 'groq' }}
+  IMPACT_PATH: ${{ vars.RI_IMPACT_PATH || 'docs/impact' }}
+
+jobs:
+  log-impact:
+    name: Log Change Impact
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Get merged changes
+        id: changes
+        run: |
+          MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+
+          # Get the diff from the merge
+          DIFF=$(git diff ${MERGE_SHA}^...${MERGE_SHA} | head -c 12000)
+          {
+            echo "diff<<DIFF_EOF"
+            echo "$DIFF"
+            echo "DIFF_EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Get changed files
+          FILES=$(git diff --name-only ${MERGE_SHA}^...${MERGE_SHA} | head -50)
+          {
+            echo "files<<FILES_EOF"
+            echo "$FILES"
+            echo "FILES_EOF"
+          } >> $GITHUB_OUTPUT
+
+          if [ -z "$FILES" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Analyze impact
+        if: steps.changes.outputs.has_changes == 'true'
+        id: analyze
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+          DIFF_CONTENT: ${{ steps.changes.outputs.diff }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+        run: |
+          # Determine API endpoint and key based on provider
+          case "$RI_PROVIDER" in
+            groq)
+              API_URL="https://api.groq.com/openai/v1/chat/completions"
+              API_KEY="$GROQ_API_KEY"
+              MODEL="${GROQ_MODEL:-llama-3.3-70b-versatile}"
+              ;;
+            openai)
+              API_URL="https://api.openai.com/v1/chat/completions"
+              API_KEY="$OPENAI_API_KEY"
+              MODEL="${OPENAI_MODEL:-gpt-4o}"
+              ;;
+            anthropic)
+              API_URL="https://api.anthropic.com/v1/messages"
+              API_KEY="$ANTHROPIC_API_KEY"
+              MODEL="${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}"
+              ;;
+            together)
+              API_URL="https://api.together.xyz/v1/chat/completions"
+              API_KEY="$TOGETHER_API_KEY"
+              MODEL="${TOGETHER_MODEL:-meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo}"
+              ;;
+            openrouter)
+              API_URL="https://openrouter.ai/api/v1/chat/completions"
+              API_KEY="$OPENROUTER_API_KEY"
+              MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.1-70b-instruct:free}"
+              ;;
+          esac
+
+          if [ -z "$API_KEY" ]; then
+            echo "API key not set for provider $RI_PROVIDER"
+            echo "result={}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PROMPT=$(jq -n -r \
+            --arg pr_number "$PR_NUMBER" \
+            --arg pr_title "$PR_TITLE" \
+            --arg pr_body "$PR_BODY" \
+            --arg merged_by "$MERGED_BY" \
+            --arg files "$CHANGED_FILES" \
+            --arg diff "$DIFF_CONTENT" \
+            '"Analyze the impact of this merged PR. Output ONLY valid JSON matching this structure:
+          {
+            \"change_id\": \"PR-\($pr_number)\",
+            \"summary\": \"Clear, concise summary of what changed (20-100 words)\",
+            \"scope\": \"patch|minor|major|breaking\",
+            \"risk_level\": \"low|medium|high|critical\",
+            \"affected_areas\": [
+              {
+                \"area\": \"Component or domain name\",
+                \"impact_type\": \"added|modified|removed|deprecated\",
+                \"files\": [\"list\", \"of\", \"files\"],
+                \"description\": \"What changed in this area\"
+              }
+            ],
+            \"breaking_changes\": [
+              {
+                \"description\": \"What breaks\",
+                \"migration_path\": \"How to update\"
+              }
+            ],
+            \"dependencies_affected\": [
+              {
+                \"name\": \"package-name\",
+                \"change_type\": \"added|removed|upgraded|downgraded\",
+                \"from_version\": \"1.0.0\",
+                \"to_version\": \"2.0.0\"
+              }
+            ],
+            \"testing_notes\": \"What should be tested, edge cases to consider\",
+            \"rollback_notes\": \"How to rollback if needed, what to watch for\"
+          }
+
+          PR #\($pr_number): \($pr_title)
+          Description: \($pr_body)
+          Merged by: \($merged_by)
+
+          Changed files:
+          \($files)
+
+          Diff:
+          \($diff)"')
+
+          if [ "$RI_PROVIDER" = "anthropic" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "x-api-key: $API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "{}"')
+          else
+            HTTP_CODE=$(curl -s -o /tmp/ri_response.json -w "%{http_code}" "$API_URL" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.1}')")
+            RESPONSE=$(cat /tmp/ri_response.json 2>/dev/null || echo '{}')
+            rm -f /tmp/ri_response.json
+            if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+              echo "::error::API call failed with HTTP $HTTP_CODE: $(echo "$RESPONSE" | head -c 500)"
+              RESPONSE='{}'
+            fi
+            RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "{}"')
+          fi
+
+          {
+            echo "result<<RESULT_EOF"
+            echo "$RESULT"
+            echo "RESULT_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Write impact log files
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultText = process.env.RESULT || '{}';
+            let impact;
+
+            try {
+              const jsonMatch = resultText.match(/\{[\s\S]*\}/);
+              impact = JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
+            } catch (e) {
+              console.log('Failed to parse result:', e.message);
+              return;
+            }
+
+            if (!impact.summary) {
+              console.log('No impact analysis generated');
+              return;
+            }
+
+            const impactPath = process.env.IMPACT_PATH;
+            const prNumber = process.env.PR_NUMBER;
+            const date = new Date().toISOString().split('T')[0];
+
+            // Add metadata
+            impact.metadata = {
+              analyzed_at: new Date().toISOString(),
+              source: {
+                type: 'pull_request',
+                ref: parseInt(prNumber)
+              },
+              pr_url: process.env.PR_URL,
+              merge_commit: process.env.MERGE_SHA
+            };
+
+            // Ensure directory exists
+            fs.mkdirSync(impactPath, { recursive: true });
+
+            // Write JSON file
+            const jsonFilename = `${impactPath}/${date}-PR-${prNumber}.json`;
+            fs.writeFileSync(jsonFilename, JSON.stringify(impact, null, 2));
+            console.log(`Written: ${jsonFilename}`);
+
+            // Write markdown summary
+            const mdFilename = `${impactPath}/${date}-PR-${prNumber}.md`;
+            const lines = [
+              '# Impact Log: PR #' + prNumber,
+              '',
+              '**Date:** ' + date,
+              '**Scope:** ' + (impact.scope || 'unknown'),
+              '**Risk Level:** ' + (impact.risk_level || 'unknown'),
+              '',
+              '## Summary',
+              impact.summary || 'No summary available.',
+              ''
+            ];
+
+            if (impact.affected_areas && impact.affected_areas.length > 0) {
+              lines.push('## Affected Areas');
+              for (const area of impact.affected_areas) {
+                lines.push('### ' + area.area);
+                lines.push('- **Impact:** ' + area.impact_type);
+                lines.push('- **Description:** ' + area.description);
+                if (area.files && area.files.length > 0) {
+                  lines.push('- **Files:** ' + area.files.map(f => '`' + f + '`').join(', '));
+                }
+                lines.push('');
+              }
+            }
+
+            if (impact.breaking_changes && impact.breaking_changes.length > 0) {
+              lines.push('## Breaking Changes');
+              for (const bc of impact.breaking_changes) {
+                lines.push('- **' + bc.description + '**');
+                lines.push('  - Migration: ' + bc.migration_path);
+              }
+              lines.push('');
+            }
+
+            if (impact.dependencies_affected && impact.dependencies_affected.length > 0) {
+              lines.push('## Dependencies Affected');
+              for (const dep of impact.dependencies_affected) {
+                let depLine = '- **' + dep.name + '**: ' + dep.change_type;
+                if (dep.from_version && dep.to_version) {
+                  depLine += ' (' + dep.from_version + ' -> ' + dep.to_version + ')';
+                }
+                lines.push(depLine);
+              }
+              lines.push('');
+            }
+
+            if (impact.testing_notes) {
+              lines.push('## Testing Notes');
+              lines.push(impact.testing_notes);
+              lines.push('');
+            }
+
+            if (impact.rollback_notes) {
+              lines.push('## Rollback Notes');
+              lines.push(impact.rollback_notes);
+              lines.push('');
+            }
+
+            lines.push('---');
+            lines.push('*Generated by [Repo Intelligence](https://github.com/anthropics/repo-intelligence)*');
+
+            fs.writeFileSync(mdFilename, lines.join('\n'));
+            console.log(`Written: ${mdFilename}`);
+        env:
+          RESULT: ${{ steps.analyze.outputs.result }}
+          IMPACT_PATH: ${{ env.IMPACT_PATH }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Commit and push impact log
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          git config user.name "repo-intelligence[bot]"
+          git config user.email "repo-intelligence[bot]@users.noreply.github.com"
+          git add "${{ env.IMPACT_PATH }}"/* 2>/dev/null || true
+          git commit -m "docs: log impact of PR #${{ github.event.pull_request.number }}
+
+          Scope: $(cat "${{ env.IMPACT_PATH }}"/*.json 2>/dev/null | jq -r '.scope // \"unknown\"' | tail -1)
+          Risk: $(cat "${{ env.IMPACT_PATH }}"/*.json 2>/dev/null | jq -r '.risk_level // \"unknown\"' | tail -1)" || echo "No changes to commit"
+          git push || echo "Push failed"
