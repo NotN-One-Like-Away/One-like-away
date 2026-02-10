@@ -1,10 +1,38 @@
 import { supabase } from './supabase';
 
+// Map any topic to its canonical cluster
+const normalizeToCanonical = (topic: string): string => {
+  const map: Record<string, string> = {
+    fitness: 'fitness', workout: 'fitness', gains: 'fitness', gym: 'fitness',
+    motivation: 'fitness', mealprep: 'fitness', health: 'fitness', protein: 'fitness',
+    tech: 'tech', ai: 'tech', coding: 'tech', programming: 'tech',
+    innovation: 'tech', automation: 'tech', developers: 'tech', devlife: 'tech',
+    crypto: 'crypto', bitcoin: 'crypto', blockchain: 'crypto', defi: 'crypto',
+    hodl: 'crypto', investing: 'crypto',
+    politics: 'politics', progressive: 'politics', conservative: 'politics',
+    justice: 'politics', equality: 'politics', healthcare: 'politics',
+    change: 'politics', reform: 'politics', workers: 'politics',
+    values: 'politics', freedom: 'politics', family: 'politics',
+    tradition: 'politics', liberty: 'politics',
+    climate: 'climate', environment: 'climate', sustainability: 'climate',
+    green: 'climate', action: 'climate', activism: 'climate',
+    gaming: 'gaming', esports: 'gaming', streaming: 'gaming',
+    games: 'gaming', streamer: 'gaming', pc: 'gaming', battlestation: 'gaming',
+    food: 'food', cooking: 'food', recipe: 'food',
+    foodie: 'food', chef: 'food', italian: 'food', baking: 'food', recipes: 'food',
+    wellness: 'wellness', meditation: 'wellness', mindfulness: 'wellness',
+    peace: 'wellness', selfcare: 'wellness', zen: 'wellness',
+    conspiracy: 'conspiracy', truth: 'conspiracy', wakeup: 'conspiracy',
+    question: 'conspiracy', research: 'conspiracy', aware: 'conspiracy', skeptic: 'conspiracy',
+  };
+  return map[topic.toLowerCase()] || topic.toLowerCase();
+};
+
 // ── Opinionated bot personas (permanent, strongly biased) ──────────────────
 const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hashtags: string[]; opinionated: true }> = {
   'FitLife_Mike': {
     opinionated: true,
-    topics: ['workout', 'gains', 'protein', 'gym'],
+    topics: ['fitness'], // Demo: canonical only
     templates: [
       "Just crushed leg day! Nothing like the burn of a good squat session. #fitness #gains",
       "Reminder: You don't need motivation, you need discipline. Get up and move! #workout #motivation",
@@ -12,11 +40,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "5AM workout crew, where you at? Early bird gets the gains! #gym #grindset",
       "Meal prep Sunday is the secret to a successful fitness week. No excuses! #mealprep #fitness"
     ],
-    hashtags: ['fitness', 'workout', 'gains', 'motivation', 'gym']
+    hashtags: ['fitness'] // Demo: canonical only
   },
   'TechNerd_Sarah': {
     opinionated: true,
-    topics: ['AI', 'coding', 'tech', 'programming'],
+    topics: ['tech'], // Demo: canonical only
     templates: [
       "Just spent 3 hours debugging only to find a missing semicolon. Classic. #coding #devlife",
       "The new AI models are getting scary good. Are we ready for this? #ai #tech",
@@ -24,11 +52,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Finally automated that tedious task. This is why I love programming! #automation #tech",
       "Reading through legacy code is like archaeology but with more crying. #programming #coding"
     ],
-    hashtags: ['tech', 'ai', 'coding', 'programming', 'innovation']
+    hashtags: ['tech'] // Demo: canonical only
   },
   'ProgressiveVoice': {
     opinionated: true,
-    topics: ['justice', 'equality', 'healthcare', 'climate'],
+    topics: ['politics'], // Demo: canonical only
     templates: [
       "Healthcare is a human right, not a privilege. When will we learn? #healthcare #progressive",
       "The climate crisis won't wait for us to get comfortable. Action needed NOW. #climate #action",
@@ -36,11 +64,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Workers deserve living wages. This shouldn't be controversial. #workers #progressive",
       "Education should lift people up, not burden them with debt. #education #reform"
     ],
-    hashtags: ['progressive', 'justice', 'equality', 'change', 'politics']
+    hashtags: ['politics'] // Demo: canonical only
   },
   'TraditionFirst': {
     opinionated: true,
-    topics: ['values', 'freedom', 'family', 'tradition'],
+    topics: ['politics'], // Demo: canonical only
     templates: [
       "Strong families build strong communities. Never forget our roots. #family #values",
       "Personal responsibility is the foundation of a free society. #freedom #conservative",
@@ -48,11 +76,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Small government, big opportunity. Let people thrive! #freedom #liberty",
       "Faith, family, and hard work. The values that built this nation. #conservative #values"
     ],
-    hashtags: ['conservative', 'values', 'freedom', 'tradition', 'politics']
+    hashtags: ['politics'] // Demo: canonical only
   },
   'CryptoKing99': {
     opinionated: true,
-    topics: ['bitcoin', 'crypto', 'defi', 'blockchain'],
+    topics: ['crypto'], // Demo: canonical only
     templates: [
       "WAGMI! This dip is a buying opportunity. Diamond hands only! #crypto #hodl",
       "Banks are obsolete. DeFi is the future and they know it. #defi #crypto",
@@ -60,11 +88,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "The next bull run will be legendary. Are you positioned? #crypto #bitcoin",
       "Blockchain technology will revolutionize everything. We're still early! #blockchain #tech"
     ],
-    hashtags: ['crypto', 'bitcoin', 'defi', 'blockchain', 'hodl']
+    hashtags: ['crypto'] // Demo: canonical only
   },
   'ZenMaster_Luna': {
     opinionated: true,
-    topics: ['meditation', 'mindfulness', 'peace', 'wellness'],
+    topics: ['wellness'], // Demo: canonical only
     templates: [
       "Started my day with 20 minutes of silence. The mind is clearer than ever. #meditation #peace",
       "Your breath is your anchor. When lost, return to it. #mindfulness #wellness",
@@ -72,11 +100,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Gratitude practice: What are three things you're thankful for today? #wellness #mindfulness",
       "The present moment is all we truly have. Embrace it fully. #mindfulness #peace"
     ],
-    hashtags: ['wellness', 'meditation', 'mindfulness', 'peace', 'selfcare']
+    hashtags: ['wellness'] // Demo: canonical only
   },
   'xX_Gamer_Xx': {
     opinionated: true,
-    topics: ['gaming', 'esports', 'streaming', 'games'],
+    topics: ['gaming'], // Demo: canonical only
     templates: [
       "Just hit a new personal best! The grind never stops. #gaming #esports",
       "That new game update is actually fire. Who's playing tonight? #gaming #games",
@@ -84,11 +112,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Hot take: Single player games > multiplayer. Quality over chaos. #gaming #unpopular",
       "My setup is finally complete. RGB everything, no regrets. #gaming #battlestation"
     ],
-    hashtags: ['gaming', 'esports', 'streamer', 'games', 'pc']
+    hashtags: ['gaming'] // Demo: canonical only
   },
   'ChefAntonio': {
     opinionated: true,
-    topics: ['cooking', 'food', 'recipes', 'italian'],
+    topics: ['food'], // Demo: canonical only
     templates: [
       "The secret to perfect pasta? Salt your water like the Mediterranean! #cooking #italian",
       "Made fresh bread today. The smell alone is worth the effort. #baking #food",
@@ -96,11 +124,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Sunday sauce simmering all day. This is what life is about. #food #italian",
       "Good olive oil is not optional, it's essential. Invest in quality! #cooking #foodie"
     ],
-    hashtags: ['food', 'cooking', 'recipe', 'foodie', 'chef']
+    hashtags: ['food'] // Demo: canonical only
   },
   'EcoWarrior_Greta': {
     opinionated: true,
-    topics: ['climate', 'environment', 'sustainability', 'green'],
+    topics: ['climate'], // Demo: canonical only
     templates: [
       "Every plastic bottle takes 450 years to decompose. Choose reusable. #environment #sustainability",
       "The science is clear. Climate action cannot wait. #climate #action",
@@ -108,11 +136,11 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Renewable energy is now cheaper than fossil fuels. The transition is inevitable. #climate #green",
       "Our planet doesn't need saving. Our habits do. #environment #change"
     ],
-    hashtags: ['climate', 'environment', 'sustainability', 'green', 'action']
+    hashtags: ['climate'] // Demo: canonical only
   },
   'TruthSeeker42': {
     opinionated: true,
-    topics: ['truth', 'research', 'questions', 'skeptic'],
+    topics: ['conspiracy'], // Demo: canonical only
     templates: [
       "Why doesn't anyone talk about this? Do your own research. #truth #wakeup",
       "The mainstream narrative doesn't add up. Connect the dots. #question #research",
@@ -120,7 +148,7 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Coincidences don't exist at this level. Think about it. #conspiracy #wakeup",
       "Question everything you're told. The truth is out there. #truth #research"
     ],
-    hashtags: ['truth', 'wakeup', 'question', 'conspiracy', 'research']
+    hashtags: ['conspiracy'] // Demo: canonical only
   }
 };
 
@@ -140,21 +168,22 @@ const DRIFTER_AVATAR_CONFIGS = [
   { face_shape: 'round', skin_color: '#8d5524', hair_style: 'mohawk', hair_color: '#222222', eye_style: 'round', eye_color: '#4a3728', mouth_style: 'neutral', accessory: 'hat' },
 ];
 
-const DRIFTER_LIFESPAN_MS = 3 * 60 * 1000; // 3 minutes
-const DRIFTER_SPAWN_INTERVAL_MS = 90 * 1000; // 1.5 minutes
-const MAX_DRIFTERS = 6;
+const DRIFTER_LIFESPAN_MS = 2 * 60 * 1000; // 2 minutes (demo: faster turnover)
+const DRIFTER_SPAWN_INTERVAL_MS = 30 * 1000; // 30 seconds (demo: rapid spawning)
+const MAX_DRIFTERS = 8; // Increased from 6 for more activity
 
-// Topic clusters that drifters can be seeded into
-// Each drifter gets a random seed that pulls them toward one echo chamber
+// Topic clusters for drifter seeding (DEMO: canonical topics only)
+// Each drifter gets seeded toward one of the 9 echo chambers
 const DRIFTER_SEED_CLUSTERS = [
-  ['fitness', 'workout', 'gains', 'gym', 'motivation'],
-  ['tech', 'ai', 'coding', 'programming', 'innovation'],
-  ['crypto', 'bitcoin', 'blockchain', 'defi', 'hodl'],
-  ['politics', 'progressive', 'conservative', 'justice', 'values'],
-  ['climate', 'environment', 'sustainability', 'green'],
-  ['gaming', 'esports', 'games', 'streaming'],
-  ['food', 'cooking', 'recipe', 'foodie'],
-  ['wellness', 'meditation', 'mindfulness', 'peace'],
+  ['fitness'],
+  ['tech'],
+  ['crypto'],
+  ['politics'],
+  ['climate'],
+  ['gaming'],
+  ['food'],
+  ['wellness'],
+  ['conspiracy'],
 ];
 
 /**
@@ -170,24 +199,29 @@ async function getBotTopicProfile(
   const topicCounts = new Map<string, number>();
 
   // Opinionated bots get very high seed weights so they stay in their lane
+  // Demo: use canonical topics only
   if (isOpinionated && persona) {
     persona.hashtags.forEach(tag => {
-      topicCounts.set(tag, 10);
+      const canonical = normalizeToCanonical(tag);
+      topicCounts.set(canonical, 15); // Increased from 10 for stronger echo chambers
     });
   }
 
   // Layer on exposure memory (drifters only) — repeated viewing builds preference
+  // Demo: normalize to canonical
   if (!isOpinionated) {
     const exposure = drifterExposure.get(botId);
     if (exposure) {
       exposure.forEach((impressions, tag) => {
-        // Each impression is worth 1 weight — accumulates fast
-        topicCounts.set(tag, (topicCounts.get(tag) || 0) + impressions);
+        const canonical = normalizeToCanonical(tag);
+        // Each impression is worth 2 weight (increased from 1 for faster clustering)
+        topicCounts.set(canonical, (topicCounts.get(canonical) || 0) + impressions * 2);
       });
     }
   }
 
   // Layer on learned preferences from past likes
+  // Demo: normalize to canonical
   const { data: likes } = await supabase
     .from('likes')
     .select('post_id, posts(topic_tags)')
@@ -198,9 +232,10 @@ async function getBotTopicProfile(
       const post = like.posts as unknown as { topic_tags: string[] } | null;
       if (post?.topic_tags) {
         post.topic_tags.forEach(tag => {
+          const canonical = normalizeToCanonical(tag);
           // Likes are worth more than impressions — active engagement reinforces
-          const w = isOpinionated ? 1 : 3;
-          topicCounts.set(tag, (topicCounts.get(tag) || 0) + w);
+          const w = isOpinionated ? 2 : 5; // Increased for demo
+          topicCounts.set(canonical, (topicCounts.get(canonical) || 0) + w);
         });
       }
     });
@@ -230,8 +265,8 @@ function getRecommendedPosts(
 
   const maxWeight = Math.max(...topicProfile.values(), 1);
   const totalExposure = Array.from(topicProfile.values()).reduce((a, b) => a + b, 0);
-  // Echo kicks in aggressively after just 5 total exposure points
-  const echoStrength = Math.min(totalExposure / 5, 1);
+  // Echo kicks in aggressively after just 3 total exposure points (reduced from 5 for demo)
+  const echoStrength = Math.min(totalExposure / 3, 1);
 
   const scored = candidates.map(post => {
     const tags = post.topic_tags || [];
@@ -239,7 +274,9 @@ function getRecommendedPosts(
     let hasMatchingTag = false;
 
     for (const tag of tags) {
-      const weight = topicProfile.get(tag) || 0;
+      // Demo: normalize to canonical before matching
+      const canonical = normalizeToCanonical(tag);
+      const weight = topicProfile.get(canonical) || 0;
       if (weight > 0) hasMatchingTag = true;
       score += weight;
     }
@@ -298,7 +335,7 @@ async function spawnDrifters(): Promise<void> {
   }
 
   const maxToSpawn = MAX_DRIFTERS - liveCount;
-  const count = Math.min(2 + Math.floor(Math.random() * 2), maxToSpawn);
+  const count = Math.min(3 + Math.floor(Math.random() * 3), maxToSpawn); // Demo: spawn 3-5 at once
 
   for (let i = 0; i < count; i++) {
     const name = DRIFTER_NAMES[Math.floor(Math.random() * DRIFTER_NAMES.length)] +
@@ -321,12 +358,12 @@ async function spawnDrifters(): Promise<void> {
       activeDrifters.add(data.id);
 
       // Give this drifter a random seed preference toward one echo chamber
-      // This simulates them having seen some content before joining
+      // Demo: canonical topics only, stronger seed for faster clustering
       const seedCluster = DRIFTER_SEED_CLUSTERS[Math.floor(Math.random() * DRIFTER_SEED_CLUSTERS.length)];
       const seedExposure = new Map<string, number>();
       seedCluster.forEach(tag => {
-        // Strong initial seed (8-12 points) so they drift toward this cluster
-        seedExposure.set(tag, 8 + Math.floor(Math.random() * 5));
+        // Strong initial seed (12-18 points, increased from 8-12) so they drift toward this cluster fast
+        seedExposure.set(tag, 12 + Math.floor(Math.random() * 7));
       });
       drifterExposure.set(data.id, seedExposure);
 
@@ -368,12 +405,14 @@ async function runDrifterLike(drifterId: string): Promise<void> {
 
   // ── Record exposure: the top posts the algo "showed" this drifter ──
   // Even without liking, seeing the same topics repeatedly builds familiarity
+  // Demo: normalize all tags to canonical for faster echo chamber formation
   const exposure = drifterExposure.get(drifterId) || new Map<string, number>();
   const feedSlice = recommended.slice(0, 10); // top 10 = their "feed"
   for (const post of feedSlice) {
     if (post.topic_tags) {
       for (const tag of post.topic_tags) {
-        exposure.set(tag, (exposure.get(tag) || 0) + 1);
+        const canonical = normalizeToCanonical(tag);
+        exposure.set(canonical, (exposure.get(canonical) || 0) + 1);
       }
     }
   }
@@ -435,9 +474,11 @@ export async function runBot(): Promise<boolean> {
     // Pick a random template
     const content = persona.templates[Math.floor(Math.random() * persona.templates.length)];
 
-    // Extract hashtags
+    // Extract hashtags and normalize to canonical topics for demo
     const hashtagMatches = content.match(/#\w+/g) || [];
-    const topicTags = hashtagMatches.map(tag => tag.slice(1).toLowerCase());
+    const topicTags = hashtagMatches
+      .map(tag => tag.slice(1).toLowerCase())
+      .map(tag => normalizeToCanonical(tag));
 
     // Insert post
     const { error: postError } = await supabase
@@ -476,7 +517,7 @@ export async function runBot(): Promise<boolean> {
       // Only consider posts that share at least one topic
       const recommended = getRecommendedPosts(recentPosts, topicProfile, bot.id)
         .filter(p => !alreadyLiked.has(p.id))
-        .filter(p => p.affinity > 0.6); // Opinionated bots are picky
+        .filter(p => p.affinity > 0.3); // Demo: less picky (was 0.6), more echo chambering
 
       if (recommended.length > 0) {
         // Strongly prefer the highest-affinity posts
@@ -534,9 +575,9 @@ let cleanupInterval: number | null = null;
 export function startBotLoop() {
   if (botInterval) return;
 
-  // Opinionated bot posting loop (15-30s)
+  // Opinionated bot posting loop (8-15s - demo: very active)
   const scheduleNext = () => {
-    const delay = 15000 + Math.random() * 15000;
+    const delay = 8000 + Math.random() * 7000;
     botInterval = window.setTimeout(async () => {
       await runBot();
       scheduleNext();
@@ -550,24 +591,23 @@ export function startBotLoop() {
   cleanupExpiredDrifters();
   cleanupInterval = window.setInterval(cleanupExpiredDrifters, 10000);
 
-  // Spawn a batch of drifters immediately, then every 1.5 minutes
+  // Spawn a batch of drifters immediately, then every 30s (demo: rapid)
   spawnDrifters();
   drifterSpawnInterval = window.setInterval(spawnDrifters, DRIFTER_SPAWN_INTERVAL_MS);
 
-  // Drifter like loop — every 3s have ALL drifters consider liking something
-  // This builds up their database likes quickly so the graph can detect clusters
+  // Drifter like loop — every 1.5s (demo: very active)
+  // ALL drifters consider liking to build database fast for echo chamber detection
   drifterLikeInterval = window.setInterval(async () => {
     const drifterIds = Array.from(activeDrifters);
     if (drifterIds.length === 0) return;
 
-    // Each drifter has a chance to like something each tick
+    // Each drifter has 90% chance to engage (demo: highly active)
     for (const drifterId of drifterIds) {
-      // 70% chance to engage each tick - simulates browsing behavior
-      if (Math.random() < 0.7) {
+      if (Math.random() < 0.9) {
         await runDrifterLike(drifterId);
       }
     }
-  }, 3000);
+  }, 1500);
 }
 
 export function stopBotLoop() {
