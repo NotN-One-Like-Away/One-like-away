@@ -42,16 +42,49 @@ const CANONICAL_CLUSTER_COLORS: Record<string, string> = {
   conspiracy: '#6b7280',
 };
 
+// Fixed hotspot positions for each cluster — arranged in a circle so they never overlap.
+// Positions are computed once relative to screen center; the radius is large enough
+// that clusters stay visually separated.
+const CLUSTER_NAMES = Object.keys(CANONICAL_CLUSTER_COLORS);
+const HOTSPOT_RADIUS = 350; // distance from center to each hotspot
+const CLUSTER_HOTSPOTS: Record<string, { x: number; y: number }> = {};
+CLUSTER_NAMES.forEach((name, i) => {
+  const angle = (2 * Math.PI * i) / CLUSTER_NAMES.length - Math.PI / 2; // start at top
+  CLUSTER_HOTSPOTS[name] = {
+    x: Math.cos(angle) * HOTSPOT_RADIUS,
+    y: Math.sin(angle) * HOTSPOT_RADIUS,
+  };
+});
+
 const TOPIC_TO_CLUSTER: Record<string, string> = {
+  // fitness
   workout: 'fitness', gym: 'fitness', gains: 'fitness', motivation: 'fitness',
+  mealprep: 'fitness', health: 'fitness', protein: 'fitness',
+  // tech
   ai: 'tech', coding: 'tech', programming: 'tech', innovation: 'tech',
+  automation: 'tech', developers: 'tech', devlife: 'tech',
+  // crypto
   bitcoin: 'crypto', blockchain: 'crypto', defi: 'crypto', hodl: 'crypto',
+  investing: 'crypto',
+  // politics
   progressive: 'politics', conservative: 'politics', justice: 'politics', values: 'politics',
+  equality: 'politics', healthcare: 'politics', change: 'politics', reform: 'politics',
+  workers: 'politics', freedom: 'politics', family: 'politics', tradition: 'politics', liberty: 'politics',
+  // climate
   environment: 'climate', sustainability: 'climate', green: 'climate',
+  action: 'climate', activism: 'climate',
+  // gaming
   esports: 'gaming', games: 'gaming', streaming: 'gaming',
+  streamer: 'gaming', pc: 'gaming', battlestation: 'gaming',
+  // food
   recipe: 'food', cooking: 'food', foodie: 'food',
+  chef: 'food', italian: 'food', baking: 'food', recipes: 'food',
+  // wellness
   meditation: 'wellness', mindfulness: 'wellness', peace: 'wellness',
+  selfcare: 'wellness', zen: 'wellness',
+  // conspiracy
   truth: 'conspiracy', wakeup: 'conspiracy', research: 'conspiracy',
+  question: 'conspiracy', aware: 'conspiracy', skeptic: 'conspiracy',
 };
 
 const normalize = (t: string): string => {
@@ -191,17 +224,24 @@ export function Graph() {
     });
 
     const infos: ClusterInfo[] = [];
-    groups.forEach((members, cluster) => {
-      if (members.length === 0) return;
-      let cx = 0, cy = 0;
-      members.forEach(m => { cx += m.x || 0; cy += m.y || 0; });
-      cx /= members.length;
-      cy /= members.length;
+
+    // Always emit an entry for every cluster that has a hotspot,
+    // even if no members yet — so auras always appear at the anchor.
+    CLUSTER_NAMES.forEach(cluster => {
+      const hotspot = CLUSTER_HOTSPOTS[cluster];
+      const members = groups.get(cluster) || [];
+
+      // Aura center = the fixed hotspot (always stable)
+      const cx = hotspot.x;
+      const cy = hotspot.y;
+
+      // Radius based on member spread around the hotspot
       let maxDist = 0;
       members.forEach(m => {
-        const d = Math.sqrt((m.x! - cx) ** 2 + (m.y! - cy) ** 2);
+        const d = Math.sqrt(((m.x || 0) - cx) ** 2 + ((m.y || 0) - cy) ** 2);
         if (d > maxDist) maxDist = d;
       });
+
       infos.push({
         id: cluster,
         name: `#${cluster}`,
@@ -211,6 +251,7 @@ export function Graph() {
         count: members.length,
       });
     });
+
     clustersRef.current = infos;
   }, []);
 
@@ -222,14 +263,30 @@ export function Graph() {
       .select('id, display_name, avatar_config, is_bot, expires_at')
       .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
 
-    const { data: likes } = await supabase
-      .from('likes')
-      .select('user_id, posts(topic_tags)');
+    const [{ data: likes }, { data: allPosts }] = await Promise.all([
+      supabase.from('likes').select('user_id, posts(topic_tags)'),
+      supabase.from('posts').select('user_id, topic_tags'),
+    ]);
 
     if (!users) return;
 
-    // Build topic profiles (cluster-normalized)
+    // Build topic profiles from BOTH posts (what they produce) AND likes (what they consume)
+    // This ensures bots always have a profile even before they've liked anything
     const profiles = new Map<string, Map<string, number>>();
+
+    // 1. Posts: what each user produces (critical for bots as cluster anchors)
+    allPosts?.forEach(p => {
+      const tags = p.topic_tags as string[] | null;
+      if (!tags || tags.length === 0) return;
+      if (!profiles.has(p.user_id)) profiles.set(p.user_id, new Map());
+      const m = profiles.get(p.user_id)!;
+      tags.forEach(t => {
+        const k = normalize(t);
+        m.set(k, (m.get(k) || 0) + 1);
+      });
+    });
+
+    // 2. Likes: what each user consumes (drives real user clustering)
     likes?.forEach(l => {
       const tags = (l.posts as unknown as { topic_tags: string[] } | null)?.topic_tags;
       if (!tags) return;
@@ -248,11 +305,16 @@ export function Graph() {
       const old = prevMap.get(u.id);
       const profile = profiles.get(u.id);
 
-      // Determine dominant cluster
+      // Determine dominant cluster — every user with ANY topic profile
+      // gets assigned to their highest-weight cluster (no staying neutral).
       let maxCluster = 'neutral', maxCount = 0;
-      if (profile) {
+      if (profile && profile.size > 0) {
         profile.forEach((count, cluster) => {
-          if (count > maxCount) { maxCount = count; maxCluster = cluster; }
+          // Only accept canonical clusters (skip raw topic names that didn't normalize)
+          if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
+            maxCount = count;
+            maxCluster = cluster;
+          }
         });
       }
 
@@ -313,77 +375,26 @@ export function Graph() {
     const fg = graphRef.current;
     forcesConfigured.current = true;
 
-    // Charge: repulsion between all nodes
+    // Charge: light repulsion — just enough to prevent total overlap
+    // Similarity force handles the real clustering logic
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const charge = fg.d3Force('charge') as any;
     if (charge?.strength) {
-      charge.strength(-80);
-      charge.distanceMax(400);
+      charge.strength(-15);      // light repulsion — prevents overlap only
+      charge.distanceMax(80);    // short range so it doesn't create a repulsion moat around clusters
       charge.distanceMin(10);
     }
 
-    // Link: similarity-weighted
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const link = fg.d3Force('link') as any;
-    if (link?.distance) link.distance(80);
-    if (link?.strength) {
-      link.strength((l: GraphLink) => Math.min(1.5, l.strength * 1.2));
-    }
+    // Remove link force — nodes no longer pull each other,
+    // they only get pulled toward their cluster hotspot.
+    fg.d3Force('link', null);
 
-    // Center: gentle
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const center = fg.d3Force('center') as any;
-    if (center?.strength) center.strength(0.05);
+    // Remove center force — hotspots already anchor nodes;
+    // centering fights the circular layout and drags nodes inward.
+    fg.d3Force('center', null);
 
-    // LIVE SIMILARITY FORCE — reads topicsRef for real-time cluster attraction
-    const similarityForce = () => {
-      let forceNodes: GraphNode[] = [];
-      const force = (alpha: number) => {
-        const topics = topicsRef.current;
-        if (topics.size === 0) return;
-
-        for (let i = 0; i < forceNodes.length; i++) {
-          const a = forceNodes[i];
-          if (a.x == null || a.y == null || !isFinite(a.x) || !isFinite(a.y)) continue;
-          const aTopics = topics.get(a.id);
-          if (!aTopics || aTopics.size === 0) continue;
-
-          for (let j = i + 1; j < forceNodes.length; j++) {
-            const b = forceNodes[j];
-            if (b.x == null || b.y == null || !isFinite(b.x) || !isFinite(b.y)) continue;
-            const bTopics = topics.get(b.id);
-            if (!bTopics || bTopics.size === 0) continue;
-
-            const dx = b.x - a.x;
-            const dy = b.y - a.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-
-            if (dist < 5 || dist > 500) continue; // zero-distance guard + cutoff
-
-            const sim = similarity(aTopics, bTopics);
-            if (sim <= 0) continue;
-
-            // Spring toward target distance, scaled by similarity
-            const targetDist = 40;
-            const diff = dist - targetDist;
-            const strength = sim * 0.4;
-            const f = diff * strength * alpha;
-
-            const nx = dx / dist;
-            const ny = dy / dist;
-            a.vx = (a.vx || 0) + nx * f;
-            a.vy = (a.vy || 0) + ny * f;
-            b.vx = (b.vx || 0) - nx * f;
-            b.vy = (b.vy || 0) - ny * f;
-          }
-        }
-      };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (force as any).initialize = (n: GraphNode[]) => { forceNodes = n; };
-      return force;
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    fg.d3Force('similarity', similarityForce() as any);
+    // Remove similarity force — all clustering is via hotspot gravity.
+    fg.d3Force('similarity', null);
 
     // Collision
     const collisionForce = () => {
@@ -419,6 +430,46 @@ export function Graph() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     fg.d3Force('collide', collisionForce() as any);
 
+    // CLUSTER GRAVITY — pulls nodes toward their cluster's FIXED HOTSPOT.
+    // Hotspots are arranged in a circle so clusters never overlap.
+    // This creates stable "basins" that keep users inside echo chambers.
+    const clusterGravityForce = () => {
+      let forceNodes: GraphNode[] = [];
+
+      const force = () => {
+        for (const n of forceNodes) {
+          if (!n.cluster || n.cluster === 'neutral') continue;
+          if (n.x == null || n.y == null || !isFinite(n.x) || !isFinite(n.y)) continue;
+
+          const hotspot = CLUSTER_HOTSPOTS[n.cluster];
+          if (!hotspot) continue;
+
+          const dx = hotspot.x - n.x;
+          const dy = hotspot.y - n.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 5) continue;
+
+          // Pull strength: stronger when far away (helps initial placement),
+          // constant minimum so nodes stay trapped inside the basin.
+          const basePull = n.is_bot ? 0.15 : 0.10;
+          // Ramp up pull for nodes far from their hotspot (> 150px)
+          const distFactor = dist > 150 ? 1 + (dist - 150) * 0.002 : 1;
+          const strength = basePull * distFactor;
+
+          const nx = dx / dist;
+          const ny = dy / dist;
+
+          n.vx = (n.vx || 0) + nx * strength;
+          n.vy = (n.vy || 0) + ny * strength;
+        }
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (force as any).initialize = (n: GraphNode[]) => { forceNodes = n; };
+      return force;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fg.d3Force('clusterGravity', clusterGravityForce() as any);
+
     fg.d3ReheatSimulation();
   }, [nodes]);
 
@@ -451,18 +502,19 @@ export function Graph() {
             m.set(k, (m.get(k) || 0) + 1);
           });
 
-          // Update node's cluster assignment live
+          // Update node's cluster assignment live (canonical clusters only)
           const node = nodesRef.current.find(n => n.id === like.user_id);
           if (node) {
             let maxCluster = 'neutral', maxCount = 0;
             m.forEach((count, cluster) => {
-              if (count > maxCount) { maxCount = count; maxCluster = cluster; }
+              if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
+                maxCount = count; maxCluster = cluster;
+              }
             });
             node.cluster = maxCluster;
             node.clusterColor = CANONICAL_CLUSTER_COLORS[maxCluster] || '#6b7280';
           }
 
-          // Reheat to make forces respond
           graphRef.current?.d3ReheatSimulation();
           updateClusterPositions();
         }
@@ -600,10 +652,14 @@ export function Graph() {
           ctx.fillStyle = color;
           ctx.fill();
         }}
-        linkColor={() => 'rgba(99, 102, 241, 0.15)'}
-        linkWidth={(link) => Math.min((link as GraphLink).strength * 3, 4)}
-        d3AlphaDecay={0.008}
-        d3VelocityDecay={0.15}
+        linkColor={(link) => {
+          const s = (link as GraphLink).strength;
+          const opacity = Math.min(0.4, s * 0.5);
+          return `rgba(99, 102, 241, ${opacity})`;
+        }}
+        linkWidth={(link) => Math.min((link as GraphLink).strength * 2.5, 3)}
+        d3AlphaDecay={0.005}
+        d3VelocityDecay={0.25}
         cooldownTime={Infinity}
       />
 
