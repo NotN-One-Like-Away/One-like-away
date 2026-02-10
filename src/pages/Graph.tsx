@@ -57,41 +57,6 @@ CLUSTER_NAMES.forEach((name, i) => {
   };
 });
 
-const TOPIC_TO_CLUSTER: Record<string, string> = {
-  // canonical names map to themselves
-  fitness: 'fitness', tech: 'tech', crypto: 'crypto', politics: 'politics',
-  climate: 'climate', gaming: 'gaming', food: 'food', wellness: 'wellness',
-  conspiracy: 'conspiracy',
-  // fitness
-  workout: 'fitness', gym: 'fitness', gains: 'fitness', motivation: 'fitness',
-  mealprep: 'fitness', health: 'fitness', protein: 'fitness',
-  // tech
-  ai: 'tech', coding: 'tech', programming: 'tech', innovation: 'tech',
-  automation: 'tech', developers: 'tech', devlife: 'tech',
-  // crypto
-  bitcoin: 'crypto', blockchain: 'crypto', defi: 'crypto', hodl: 'crypto',
-  investing: 'crypto',
-  // politics
-  progressive: 'politics', conservative: 'politics', justice: 'politics', values: 'politics',
-  equality: 'politics', healthcare: 'politics', change: 'politics', reform: 'politics',
-  workers: 'politics', freedom: 'politics', family: 'politics', tradition: 'politics', liberty: 'politics',
-  // climate
-  environment: 'climate', sustainability: 'climate', green: 'climate',
-  action: 'climate', activism: 'climate',
-  // gaming
-  esports: 'gaming', games: 'gaming', streaming: 'gaming',
-  streamer: 'gaming', pc: 'gaming', battlestation: 'gaming',
-  // food
-  recipe: 'food', cooking: 'food', foodie: 'food',
-  chef: 'food', italian: 'food', baking: 'food', recipes: 'food',
-  // wellness
-  meditation: 'wellness', mindfulness: 'wellness', peace: 'wellness',
-  selfcare: 'wellness', zen: 'wellness',
-  // conspiracy
-  truth: 'conspiracy', wakeup: 'conspiracy', research: 'conspiracy',
-  question: 'conspiracy', aware: 'conspiracy', skeptic: 'conspiracy',
-};
-
 /**
  * Determine dominant cluster with hysteresis to prevent oscillation.
  * Requires a clear leader (dominanceRatio × second place) to assign identity.
