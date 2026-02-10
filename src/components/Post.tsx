@@ -129,7 +129,7 @@ export function Post({ post, onLikeChange }: PostProps) {
         );
         
         // Build batch upsert with updated weights
-        const upsertData = attractionRecords.map(({ source_id, target_id, canonical }) => ({
+        const upsertData = attractionRecords.map(({ source_id, target_id }) => ({
           source_id,
           target_id,
           weight: (existingWeights.get(target_id) || 0) + 1.0,

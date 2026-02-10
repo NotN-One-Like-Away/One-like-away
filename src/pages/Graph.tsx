@@ -92,11 +92,6 @@ const TOPIC_TO_CLUSTER: Record<string, string> = {
   question: 'conspiracy', aware: 'conspiracy', skeptic: 'conspiracy',
 };
 
-const normalize = (t: string): string => {
-  const lower = t.toLowerCase().replace(/^#/, '');
-  return TOPIC_TO_CLUSTER[lower] || lower;
-};
-
 /**
  * Determine dominant cluster with hysteresis to prevent oscillation.
  * Requires a clear leader (dominanceRatio × second place) to assign identity.

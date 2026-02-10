@@ -87,7 +87,7 @@ export function Feed() {
     // Filter: as echo grows, threshold for inclusion rises
     const affinityThreshold = 0.1 + (echoStrength * 0.5);
 
-    const filtered = scoredPosts.filter(({ affinity, isRecent }) => {
+    const filtered = scoredPosts.filter(({ affinity }) => {
       // NO recent post bypass once user has preferences - outcomes based EXCLUSIVELY on likes
       if (likedTopics.size === 0) {
         // No preferences yet - show everything

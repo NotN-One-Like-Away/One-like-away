@@ -7,7 +7,7 @@ const attractionGraph = new Map<string, Map<string, number>>();
 
 // Pending database writes (batched for performance)
 let pendingWrites = new Map<string, { source_id: string; target_id: string; weight: number }>();
-let flushTimeout: NodeJS.Timeout | null = null;
+let flushTimeout: number | null = null;
 
 /**
  * Check if a user ID is a demo user (not in database)
