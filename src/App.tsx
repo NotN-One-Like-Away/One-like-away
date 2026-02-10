@@ -1,35 +1,50 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { useUserStore } from './stores/userStore';
+import { AvatarBuilder } from './components/AvatarBuilder';
+import { PasswordGate } from './components/PasswordGate';
+import { Feed } from './pages/Feed';
+import { Graph } from './pages/Graph';
+import type { AvatarConfig } from './types';
 
 function App() {
-  const [count, setCount] = useState(0)
-
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/feed" element={<ProtectedFeed />} />
+        <Route path="/graph" element={<PasswordGate><Graph /></PasswordGate>} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
 
-export default App
+function Home() {
+  const { user, isExpired, createSession } = useUserStore();
+  const navigate = useNavigate();
+
+  // If user has valid session, redirect to feed
+  if (user && !isExpired) {
+    return <Navigate to="/feed" replace />;
+  }
+
+  async function handleAvatarComplete(config: AvatarConfig, name: string) {
+    const newUser = await createSession(config, name);
+    if (newUser) {
+      navigate('/feed');
+    }
+  }
+
+  return <AvatarBuilder onComplete={handleAvatarComplete} />;
+}
+
+function ProtectedFeed() {
+  const { user } = useUserStore();
+
+  if (!user) {
+    return <Navigate to="/" replace />;
+  }
+
+  return <Feed />;
+}
+
+export default App;
