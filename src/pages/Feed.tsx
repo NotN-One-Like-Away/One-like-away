@@ -9,6 +9,7 @@ import type { Post as PostType } from '../types';
 
 export function Feed() {
   const [posts, setPosts] = useState<PostType[]>([]);
+  const [recommendedPosts, setRecommendedPosts] = useState<PostType[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [showCompose, setShowCompose] = useState(false);
   const [likedTopics, setLikedTopics] = useState<Map<string, number>>(new Map());
@@ -17,16 +18,17 @@ export function Feed() {
 
   // Calculate affinity score for a post based on liked topics
   // This is the core echo chamber mechanism - users get trapped fast
-  const calculateAffinity = useCallback((post: PostType): number => {
+  const calculateAffinity = useCallback((post: PostType, topicMap: Map<string, string>): number => {
     if (likedTopics.size === 0) return 1; // No preferences yet, show everything
 
     let score = 0;
     const tags = post.topic_tags || [];
 
-    // Check if ANY tag matches user's interests
+    // Check if ANY tag matches user's interests (after canonicalization)
     let hasMatchingTag = false;
     for (const tag of tags) {
-      const topicWeight = likedTopics.get(tag) || 0;
+      const canonical = topicMap.get(tag.toLowerCase().replace(/^#/, '')) || tag.toLowerCase();
+      const topicWeight = likedTopics.get(canonical) || 0;
       if (topicWeight > 0) hasMatchingTag = true;
       score += topicWeight;
     }
@@ -59,67 +61,74 @@ export function Feed() {
       return allPosts;
     }
 
+    // Build topic normalization map once
+    const topicMap = new Map<string, string>([
+      ['fitness', 'fitness'], ['workout', 'fitness'], ['gains', 'fitness'], ['gym', 'fitness'],
+      ['tech', 'tech'], ['ai', 'tech'], ['coding', 'tech'], ['programming', 'tech'],
+      ['crypto', 'crypto'], ['bitcoin', 'crypto'], ['blockchain', 'crypto'],
+      ['politics', 'politics'], ['progressive', 'politics'], ['conservative', 'politics'],
+      ['climate', 'climate'], ['environment', 'climate'], ['sustainability', 'climate'],
+      ['gaming', 'gaming'], ['esports', 'gaming'], ['games', 'gaming'],
+      ['food', 'food'], ['cooking', 'food'], ['recipe', 'food'],
+      ['wellness', 'wellness'], ['meditation', 'wellness'], ['mindfulness', 'wellness'],
+      ['conspiracy', 'conspiracy'], ['truth', 'conspiracy'], ['wakeup', 'conspiracy'],
+    ]);
+
     const totalLikes = Array.from(likedTopics.values()).reduce((a, b) => a + b, 0);
     const echoStrength = Math.min(totalLikes / 3, 1);
 
-    // Score each post
+    // Score each post (sync now!)
     const scoredPosts = allPosts.map(post => ({
       post,
-      affinity: calculateAffinity(post),
-      isRecent: Date.now() - new Date(post.created_at).getTime() < 30000, // Last 30 seconds
+      affinity: calculateAffinity(post, topicMap),
+      isRecent: Date.now() - new Date(post.created_at).getTime() < 30000,
     }));
 
     // Filter: as echo grows, threshold for inclusion rises
-    // At max echo, only posts with >0.6 affinity make it through
     const affinityThreshold = 0.1 + (echoStrength * 0.5);
 
     const filtered = scoredPosts.filter(({ affinity, isRecent }) => {
-      // Very recent posts get a pass (but still sorted down if low affinity)
       if (isRecent) return true;
-      // Hard cutoff based on echo strength
-      if (affinity < affinityThreshold) return false;
-      // Probabilistic for edge cases
-      return Math.random() < (affinity * 1.5);
+      // Deterministic filtering based purely on affinity and echo strength
+      return affinity >= affinityThreshold;
     });
 
     // Sort: affinity is king, recency is secondary
     filtered.sort((a, b) => {
-      // Strong affinity difference = sort by affinity
       const affinityDiff = b.affinity - a.affinity;
       if (Math.abs(affinityDiff) > 0.15) return affinityDiff;
-
-      // Similar affinity = sort by time
       return new Date(b.post.created_at).getTime() - new Date(a.post.created_at).getTime();
     });
 
     return filtered.map(({ post }) => post);
   }, [likedTopics, calculateAffinity]);
 
-  // Fetch user's liked topics
+  // Fetch user's liked topics from attraction graph
   const fetchLikedTopics = useCallback(async () => {
     if (!user) return;
 
+    // Get liked post IDs for UI state
     const { data: likes } = await supabase
       .from('likes')
-      .select('post_id, posts(topic_tags)')
+      .select('post_id')
       .eq('user_id', user.id);
 
-    if (!likes) return;
+    if (likes) {
+      likedPostIdsRef.current = new Set(likes.map(l => l.post_id));
+    }
 
+    // Get topic attractions from the attraction graph (single source of truth)
+    const { getUserAttractions } = await import('../lib/botRunner');
+    const attractions = getUserAttractions(user.id);
+    
     const topicCounts = new Map<string, number>();
-    const likedIds = new Set<string>();
-
-    likes.forEach((like) => {
-      likedIds.add(like.post_id);
-      const post = like.posts as unknown as { topic_tags: string[] } | null;
-      if (post?.topic_tags) {
-        post.topic_tags.forEach((tag) => {
-          topicCounts.set(tag, (topicCounts.get(tag) || 0) + 1);
-        });
+    attractions.forEach((weight, targetId) => {
+      if (targetId.startsWith('topic:')) {
+        const topic = targetId.slice(6); // Remove 'topic:' prefix
+        topicCounts.set(topic, weight);
       }
     });
 
-    likedPostIdsRef.current = likedIds;
     setLikedTopics(topicCounts);
   }, [user]);
 
@@ -157,11 +166,11 @@ export function Feed() {
     setIsLoading(false);
   }, []);
 
-  // Handle like changes - update topics and refetch
-  const handleLikeChange = useCallback(async () => {
-    await fetchLikedTopics();
-    await fetchPosts();
-  }, [fetchLikedTopics, fetchPosts]);
+  // Handle like changes - debounced to avoid too many refetches
+  const handleLikeChange = useCallback(() => {
+    // Debounce: only update topics, posts already updated via realtime
+    setTimeout(() => fetchLikedTopics(), 500);
+  }, [fetchLikedTopics]);
 
   // Add a single new post to the feed (for realtime)
   const addNewPost = useCallback(async (postId: string) => {
@@ -198,6 +207,9 @@ export function Feed() {
     fetchLikedTopics();
     fetchPosts();
 
+    // Debounce timer for attraction updates
+    let attractionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
     // Subscribe to realtime updates
     const channel = supabase
       .channel('feed-realtime')
@@ -211,21 +223,43 @@ export function Feed() {
       )
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'likes' },
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'attractions',
+          filter: user ? `source_id=eq.${user.id}` : undefined
+        },
         () => {
-          // Likes changed - refresh counts
-          fetchPosts();
+          // User's attractions changed - debounce to handle batch updates
+          if (attractionDebounceTimer) {
+            clearTimeout(attractionDebounceTimer);
+          }
+          attractionDebounceTimer = setTimeout(() => {
+            fetchLikedTopics();
+            attractionDebounceTimer = null;
+          }, 1000); // Wait 1s after last update before refreshing
         }
       )
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [fetchPosts, fetchLikedTopics, addNewPost]);
+    // Periodic refresh for like counts (less aggressive than realtime)
+    const refreshInterval = setInterval(() => {
+      fetchPosts();
+    }, 10000); // Every 10 seconds
 
-  // Get recommended posts based on user's interests
-  const recommendedPosts = getRecommendedPosts(posts);
+    return () => {
+      if (attractionDebounceTimer) {
+        clearTimeout(attractionDebounceTimer);
+      }
+      supabase.removeChannel(channel);
+      clearInterval(refreshInterval);
+    };
+  }, [fetchPosts, fetchLikedTopics, addNewPost, user]);
+
+  // Compute recommended posts whenever posts or liked topics change
+  useEffect(() => {
+    setRecommendedPosts(getRecommendedPosts(posts));
+  }, [posts, likedTopics, getRecommendedPosts]);
 
   if (isExpired) {
     return (

@@ -22,25 +22,124 @@ export function Post({ post, onLikeChange }: PostProps) {
 
     setIsLoading(true);
 
+    // Store original user ID to detect promotion
+    const originalUserId = user.id;
+
+    // Promote demo user to real user on first interaction
+    const promoted = await useUserStore.getState().promoteToRealUser();
+    if (!promoted) {
+      setIsLoading(false);
+      return;
+    }
+
+    // Get potentially updated user after promotion
+    const currentUser = useUserStore.getState().user;
+    if (!currentUser) {
+      setIsLoading(false);
+      return;
+    }
+
+    // If user was promoted (ID changed), transfer their attraction history
+    if (originalUserId !== currentUser.id) {
+      const { transferDemoAttractions } = await import('../lib/botRunner');
+      await transferDemoAttractions(originalUserId, currentUser.id);
+    }
+
     if (isLiked) {
       const { error } = await supabase
         .from('likes')
         .delete()
-        .eq('user_id', user.id)
+        .eq('user_id', currentUser.id)
         .eq('post_id', post.id);
 
       if (!error) {
         setIsLiked(false);
         setLikesCount((c) => c - 1);
+        
+        // Batch reduce attraction when unliking
+        const { normalizeToCanonical } = await import('../lib/botRunner');
+        
+        const attractionRecords = post.topic_tags.map(tag => {
+          const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+          return `topic:${canonical}`;
+        });
+        
+        // Get current weights
+        const { data: existingAttractions } = await supabase
+          .from('attractions')
+          .select('target_id, weight')
+          .eq('source_id', currentUser.id)
+          .in('target_id', attractionRecords);
+        
+        if (existingAttractions && existingAttractions.length > 0) {
+          // Batch update: reduce by 0.5 or delete if <= 0
+          const toUpdate = existingAttractions
+            .map(a => ({
+              source_id: currentUser.id,
+              target_id: a.target_id,
+              weight: Math.max(0, a.weight - 0.5),
+            }))
+            .filter(a => a.weight > 0);
+          
+          const toDelete = existingAttractions
+            .filter(a => a.weight <= 0.5)
+            .map(a => a.target_id);
+          
+          if (toUpdate.length > 0) {
+            await supabase.from('attractions').upsert(toUpdate);
+          }
+          if (toDelete.length > 0) {
+            await supabase.from('attractions').delete()
+              .eq('source_id', currentUser.id)
+              .in('target_id', toDelete);
+          }
+        }
       }
     } else {
       const { error } = await supabase
         .from('likes')
-        .insert({ user_id: user.id, post_id: post.id });
+        .insert({ user_id: currentUser.id, post_id: post.id });
 
       if (!error) {
         setIsLiked(true);
         setLikesCount((c) => c + 1);
+        
+        // Update attraction graph for this user
+        const { normalizeToCanonical } = await import('../lib/botRunner');
+        
+        // Batch all attraction updates into a single database transaction
+        const attractionRecords = post.topic_tags.map(tag => {
+          const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+          return {
+            source_id: currentUser.id,
+            target_id: `topic:${canonical}`,
+            canonical // for logging
+          };
+        });
+        
+        // Get current weights from database in one query
+        const { data: existingAttractions } = await supabase
+          .from('attractions')
+          .select('target_id, weight')
+          .eq('source_id', currentUser.id)
+          .in('target_id', attractionRecords.map(r => r.target_id));
+        
+        const existingWeights = new Map(
+          (existingAttractions || []).map(a => [a.target_id, a.weight])
+        );
+        
+        // Build batch upsert with updated weights
+        const upsertData = attractionRecords.map(({ source_id, target_id, canonical }) => ({
+          source_id,
+          target_id,
+          weight: (existingWeights.get(target_id) || 0) + 1.0,
+          updated_at: new Date().toISOString(),
+        }));
+        
+        // Single batch upsert
+        await supabase.from('attractions').upsert(upsertData);
+        
+        console.log(`✓ Liked post → +1.0 to: ${attractionRecords.map(r => r.canonical).join(', ')}`);
       }
     }
 

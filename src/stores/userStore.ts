@@ -20,6 +20,7 @@ interface UserStore {
   isExpired: boolean;
   setUser: (user: User | null) => void;
   createSession: (avatarConfig: AvatarConfig, displayName: string) => Promise<User | null>;
+  promoteToRealUser: () => Promise<boolean>;
   updateTimeRemaining: (seconds: number) => void;
   setExpired: () => void;
   clearSession: () => void;
@@ -48,6 +49,40 @@ export const useUserStore = create<UserStore>()(
 
       setUser: (user) => set({ user }),
 
+      promoteToRealUser: async () => {
+        const currentUser = get().user;
+        if (!currentUser || isValidUUID(currentUser.id)) {
+          return true; // Already real or no user
+        }
+
+        if (!isSupabaseConfigured()) {
+          console.warn('Cannot promote demo user: Supabase not configured');
+          return false;
+        }
+
+        // Create real Supabase user with same data
+        const { data, error } = await supabase
+          .from('users')
+          .insert({
+            avatar_config: currentUser.avatar_config,
+            display_name: currentUser.display_name,
+            is_bot: false,
+            expires_at: currentUser.expires_at,
+          })
+          .select()
+          .single();
+
+        if (error) {
+          console.error('Failed to promote demo user:', error);
+          return false;
+        }
+
+        // Replace demo user with real user
+        console.log(`Promoted demo user "${currentUser.display_name}" → real user (${data.id})`);
+        set({ user: data });
+        return true;
+      },
+
       createSession: async (avatarConfig, displayName) => {
         const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
 
@@ -68,6 +103,7 @@ export const useUserStore = create<UserStore>()(
             timeRemaining: SESSION_DURATION_MS / 1000,
             isExpired: false
           });
+          
           return demoUser;
         }
 
@@ -108,6 +144,7 @@ export const useUserStore = create<UserStore>()(
           timeRemaining: SESSION_DURATION_MS / 1000,
           isExpired: false
         });
+        
         return data;
       },
 

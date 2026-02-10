@@ -21,6 +21,27 @@ export function ComposePost({ onClose, onPostCreated }: ComposePostProps) {
     setError('');
 
     try {
+      // Store original user ID to detect promotion
+      const originalUserId = user.id;
+
+      // Promote demo user to real user on first interaction
+      const promoted = await useUserStore.getState().promoteToRealUser();
+      if (!promoted) {
+        throw new Error('Failed to create user session');
+      }
+
+      // Get potentially updated user after promotion
+      const currentUser = useUserStore.getState().user;
+      if (!currentUser) {
+        throw new Error('No user session');
+      }
+
+      // If user was promoted (ID changed), transfer their attraction history
+      if (originalUserId !== currentUser.id) {
+        const { transferDemoAttractions } = await import('../lib/botRunner');
+        await transferDemoAttractions(originalUserId, currentUser.id);
+      }
+
       // For MVP: just post the content directly
       // TODO: Call LLM to expand the content
       const expandedContent = content.trim();
@@ -29,7 +50,7 @@ export function ComposePost({ onClose, onPostCreated }: ComposePostProps) {
       const topicTags = extractHashtags(expandedContent);
 
       const { error: insertError } = await supabase.from('posts').insert({
-        user_id: user.id,
+        user_id: currentUser.id,
         content: expandedContent,
         topic_tags: topicTags,
       });

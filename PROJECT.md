@@ -46,14 +46,18 @@ Two types of bots keep the platform alive:
 4. Sort by affinity, then recency
 5. Effect intensifies with more likes - users get trapped faster
 
-### Graph Physics
-1. Build topic profile for each user from their likes
-2. Calculate similarity between all user pairs (shared topics)
-3. Create links with strength = similarity score
-4. **Link force**: Similar users get pulled together
-5. **Charge force**: Unrelated users drift apart
-6. **Cluster force**: Same-cluster nodes attract each other
-7. Echo chambers emerge naturally from the physics
+### Graph Physics (Real-time Topic Assignment)
+**Data flow**: Likes → Post tags → Cluster assignment → Visual pull + color
+
+1. User likes a post → Realtime subscription fires
+2. Post's `topic_tags` are fetched and normalized to canonical clusters
+3. User's **likes-only topic profile** is updated (separate from posts they create)
+4. User is assigned to their **dominant cluster** (whichever topic they've liked most)
+5. Node adopts that cluster's **color** and is pulled toward its **fixed hotspot position**
+6. **Cluster gravity force**: Pulls nodes toward their assigned hotspot (9 hotspots in circle layout)
+7. **Charge force**: Short-range repulsion to prevent node overlap
+8. **No pairwise forces**: Nodes don't pull each other—only anchored to cluster hotspots
+9. Echo chambers form as users visually segregate by their like behavior
 
 ## Tech Stack
 

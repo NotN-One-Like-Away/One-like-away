@@ -218,3 +218,56 @@ SELECT u.id, p.id
 FROM users u, posts p
 WHERE u.display_name = 'EcoWarrior_Greta'
 AND p.topic_tags && ARRAY['progressive', 'healthcare'];
+
+-- Seed attraction data for all bots
+-- This creates the ideological gravity wells that pull drifters and users into echo chambers
+
+-- FitLife_Mike: fitness cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:fitness', 3.0
+FROM users WHERE display_name = 'FitLife_Mike';
+
+-- TechNerd_Sarah: tech cluster  
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:tech', 3.0
+FROM users WHERE display_name = 'TechNerd_Sarah';
+
+-- ProgressiveVoice: politics cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:politics', 3.0
+FROM users WHERE display_name = 'ProgressiveVoice';
+
+-- TraditionFirst: politics cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:politics', 3.0
+FROM users WHERE display_name = 'TraditionFirst';
+
+-- CryptoKing99: crypto cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:crypto', 3.0
+FROM users WHERE display_name = 'CryptoKing99';
+
+-- ZenMaster_Luna: wellness cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:wellness', 3.0
+FROM users WHERE display_name = 'ZenMaster_Luna';
+
+-- xX_Gamer_Xx: gaming cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:gaming', 3.0
+FROM users WHERE display_name = 'xX_Gamer_Xx';
+
+-- ChefAntonio: food cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:food', 3.0
+FROM users WHERE display_name = 'ChefAntonio';
+
+-- EcoWarrior_Greta: climate cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:climate', 3.0
+FROM users WHERE display_name = 'EcoWarrior_Greta';
+
+-- TruthSeeker42: conspiracy cluster
+INSERT INTO attractions (source_id, target_id, weight)
+SELECT id, 'topic:conspiracy', 3.0
+FROM users WHERE display_name = 'TruthSeeker42';

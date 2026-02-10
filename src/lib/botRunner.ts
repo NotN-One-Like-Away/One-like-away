@@ -1,7 +1,273 @@
 import { supabase } from './supabase';
 
+// ── Attraction scoring: materialize implicit behavioral patterns ──────────
+// In-memory attraction graph: source_id → target_id → weight
+// This tracks behavioral drift without needing database setup (hackathon-friendly)
+const attractionGraph = new Map<string, Map<string, number>>();
+
+// Pending database writes (batched for performance)
+let pendingWrites = new Map<string, { source_id: string; target_id: string; weight: number }>();
+let flushTimeout: NodeJS.Timeout | null = null;
+
+/**
+ * Check if a user ID is a demo user (not in database)
+ */
+function isDemoUser(userId: string): boolean {
+  return userId.startsWith('demo-');
+}
+
+/**
+ * Flush pending attraction updates to database in a single batch
+ * Filters out demo users to avoid foreign key constraint violations
+ */
+async function flushAttractionUpdates(): Promise<void> {
+  if (pendingWrites.size === 0) return;
+  
+  // Filter out demo users - they exist only in local state until promoted
+  const batch = Array.from(pendingWrites.values())
+    .filter(update => !isDemoUser(update.source_id))
+    .map(update => ({
+      ...update,
+      updated_at: new Date().toISOString(),
+    }));
+  
+  pendingWrites.clear();
+  
+  if (batch.length === 0) return; // All updates were for demo users
+  
+  // Single batch upsert for all pending updates
+  const { error } = await supabase.from('attractions').upsert(batch);
+  if (error) {
+    console.error('Failed to flush attractions:', error);
+  }
+}
+
+/**
+ * Schedule a flush if not already scheduled
+ */
+function scheduleFlush(): void {
+  if (flushTimeout) return;
+  flushTimeout = setTimeout(() => {
+    flushTimeout = null;
+    flushAttractionUpdates();
+  }, 2000); // Batch writes every 2 seconds
+}
+
+/**
+ * Update attraction between a source (user/bot) and target (topic/user).
+ * This drives live graph reconfiguration based on behavior, not just topology.
+ * 
+ * Attraction accumulates from:
+ * - Likes (strong: +1.0 per like)
+ * - Exposure (weak: +0.02 per impression, saturating)
+ * - Posts (gravity wells: +2.0 for opinionated bots)
+ * 
+ * Now batches writes to database for performance.
+ */
+async function updateAttraction(
+  sourceId: string,
+  targetId: string,
+  delta: number
+): Promise<void> {
+  // Update in-memory graph immediately (works for both demo and real users)
+  if (!attractionGraph.has(sourceId)) {
+    attractionGraph.set(sourceId, new Map());
+  }
+  const targets = attractionGraph.get(sourceId)!;
+  const newWeight = (targets.get(targetId) || 0) + delta;
+  targets.set(targetId, newWeight);
+
+  // Queue database write only for real users (not demo users)
+  if (!isDemoUser(sourceId)) {
+    const key = `${sourceId}:${targetId}`;
+    pendingWrites.set(key, {
+      source_id: sourceId,
+      target_id: targetId,
+      weight: newWeight,
+    });
+    
+    scheduleFlush();
+  }
+}
+
+/**
+ * Decay attractions over time to prevent unbounded growth.
+ * This keeps the echo chamber effect dynamic and allows for preference shifts.
+ * Demo users are tracked in-memory but not persisted to database.
+ */
+function decayAttraction(agentId: string, factor = 0.98): void {
+  const profile = attractionGraph.get(agentId);
+  if (!profile) return;
+
+  const isDemo = isDemoUser(agentId);
+
+  for (const [targetId, weight] of profile) {
+    const decayed = weight * factor;
+    if (decayed < 0.05) {
+      profile.delete(targetId);
+      if (!isDemo) {
+        // Queue deletion in database (only for real users)
+        pendingWrites.delete(`${agentId}:${targetId}`);
+      }
+    } else {
+      profile.set(targetId, decayed);
+      if (!isDemo) {
+        // Queue update in database (only for real users)
+        const key = `${agentId}:${targetId}`;
+        pendingWrites.set(key, {
+          source_id: agentId,
+          target_id: targetId,
+          weight: decayed,
+        });
+      }
+    }
+  }
+  
+  if (!isDemo) {
+    scheduleFlush();
+  }
+}
+
+/**
+ * Get attraction scores for any agent (for graph/feed integration)
+ */
+export function getUserAttractions(userId: string): Map<string, number> {
+  return attractionGraph.get(userId) || new Map();
+}
+
+/**
+ * Transfer attractions from demo user to real user when promoted.
+ * Call this after promoting a demo user to persist their history.
+ */
+export async function transferDemoAttractions(demoUserId: string, realUserId: string): Promise<void> {
+  const demoAttractions = attractionGraph.get(demoUserId);
+  if (!demoAttractions || demoAttractions.size === 0) return;
+
+  // Copy to new user ID in memory
+  attractionGraph.set(realUserId, new Map(demoAttractions));
+  
+  // Persist to database (batch upsert)
+  const batch = Array.from(demoAttractions.entries()).map(([targetId, weight]) => ({
+    source_id: realUserId,
+    target_id: targetId,
+    weight: weight,
+    updated_at: new Date().toISOString(),
+  }));
+
+  if (batch.length > 0) {
+    const { error } = await supabase.from('attractions').upsert(batch);
+    if (error) {
+      console.error('Failed to transfer demo attractions:', error);
+    } else {
+      console.log(`✓ Transferred ${batch.length} attractions from demo → ${realUserId}`);
+    }
+  }
+
+  // Clean up old demo user
+  attractionGraph.delete(demoUserId);
+}
+
+/**
+ * Get all attraction data (for debugging/metrics)
+ */
+export function getAllAttractions(): Map<string, Map<string, number>> {
+  return attractionGraph;
+}
+
+/**
+ * Initialize attraction graph from database.
+ * This ensures users/bots retain their attraction history across sessions.
+ */
+export async function initializeAttractionGraph(): Promise<void> {
+  console.log('Initializing attraction graph from database...');
+  
+  // Clear existing (for hot reload)
+  attractionGraph.clear();
+
+  // 1. Load ALL attraction data from database (primary source of truth)
+  const { data: attractions } = await supabase
+    .from('attractions')
+    .select('source_id, target_id, weight');
+
+  if (attractions && attractions.length > 0) {
+    attractions.forEach(a => {
+      if (!attractionGraph.has(a.source_id)) {
+        attractionGraph.set(a.source_id, new Map());
+      }
+      attractionGraph.get(a.source_id)!.set(a.target_id, a.weight);
+    });
+    console.log(`Loaded ${attractions.length} attraction records from database`);
+  } else {
+    console.log('No existing attractions - will seed from historical data');
+    
+    // FALLBACK: If database is empty, seed from likes (one-time migration)
+    const { data: likes } = await supabase
+      .from('likes')
+      .select('user_id, posts(topic_tags)');
+
+    if (likes) {
+      const updates: Promise<void>[] = [];
+      likes.forEach(like => {
+        const tags = (like.posts as unknown as { topic_tags: string[] } | null)?.topic_tags;
+        if (!tags) return;
+        
+        tags.forEach(tag => {
+          const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+          updates.push(updateAttraction(like.user_id, `topic:${canonical}`, 1.0));
+        });
+      });
+      await Promise.all(updates);
+      console.log(`Seeded ${updates.length} attractions from historical likes`);
+    }
+  }
+
+  // 2. Ensure opinionated bots always have their ideological anchors
+  const { data: users } = await supabase
+    .from('users')
+    .select('id, display_name, is_bot')
+    .eq('is_bot', true)
+    .is('expires_at', null);
+
+  if (users) {
+    const botUpdates: Promise<void>[] = [];
+    users.forEach(bot => {
+      const persona = BOT_PERSONAS[bot.display_name];
+      if (persona) {
+        // Check if bot already has attraction data
+        const existing = attractionGraph.get(bot.id);
+        const needsSeed = !existing || existing.size === 0;
+        
+        if (needsSeed) {
+          // Opinionated bots = gravity wells
+          persona.hashtags.forEach(tag => {
+            botUpdates.push(updateAttraction(bot.id, `topic:${tag}`, 3.0));
+          });
+        }
+      }
+    });
+    if (botUpdates.length > 0) {
+      await Promise.all(botUpdates);
+      console.log(`Seeded ${botUpdates.length} bot attractions`);
+    }
+  }
+
+  // 3. Track existing drifters
+  const now = new Date().toISOString();
+  const { data: drifters } = await supabase
+    .from('users')
+    .select('id')
+    .not('expires_at', 'is', null)
+    .gt('expires_at', now);
+
+  drifters?.forEach(d => activeDrifters.add(d.id));
+
+  const attractionCount = Array.from(attractionGraph.values())
+    .reduce((sum, targets) => sum + targets.size, 0);
+  console.log(`Initialized ${attractionGraph.size} agents with ${attractionCount} attraction edges`);
+}
+
 // Map any topic to its canonical cluster
-const normalizeToCanonical = (topic: string): string => {
+export const normalizeToCanonical = (topic: string): string => {
   const map: Record<string, string> = {
     fitness: 'fitness', workout: 'fitness', gains: 'fitness', gym: 'fitness',
     motivation: 'fitness', mealprep: 'fitness', health: 'fitness', protein: 'fitness',
@@ -27,6 +293,15 @@ const normalizeToCanonical = (topic: string): string => {
   };
   return map[topic.toLowerCase()] || topic.toLowerCase();
 };
+
+/**
+ * Internal: Get topic profile for ANY agent (bot, drifter, user).
+ * This is the ONLY source of truth for "what this agent is attracted to".
+ * Everything downstream (feed, graph, clustering) reads from this.
+ */
+function getAgentTopicProfile(agentId: string): Map<string, number> {
+  return attractionGraph.get(agentId) || new Map();
+}
 
 // ── Opinionated bot personas (permanent, strongly biased) ──────────────────
 const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hashtags: string[]; opinionated: true }> = {
@@ -152,20 +427,30 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
   }
 };
 
-// ── Drifter bot names & avatars (neutral, short-lived) ─────────────────────
+// ── Drifter bot names & avatars (look like real users) ─────────────────────
 const DRIFTER_NAMES = [
-  'Wanderer_01', 'Curious_Cat', 'JustBrowsing', 'NewHere_99',
-  'Passerby', 'RandomUser42', 'LurkMode', 'OpenMind',
-  'NoSides', 'JustVibes', 'ScrollerX', 'NeutralNick',
-  'FenceRider', 'Observer_7', 'BlankSlate',
+  'Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey',
+  'Riley', 'Quinn', 'Avery', 'Parker', 'Drew',
+  'Sam', 'Jamie', 'Reese', 'Skyler', 'Dakota',
+  'Charlie', 'Frankie', 'Emery', 'Sage', 'Rowan',
+  'Kai', 'Hayden', 'Finley', 'Nico', 'Ezra',
+  'Mika', 'Jules', 'Ariel', 'Robin', 'Eden',
+  'Noa', 'Luca', 'Jude', 'River', 'Wren',
+  'Felix', 'Leo', 'Milo', 'Iris', 'Luna',
+  'Zara', 'Noor', 'Yuki', 'Soren', 'Asha',
 ];
 
 const DRIFTER_AVATAR_CONFIGS = [
-  { face_shape: 'round', skin_color: '#e8beac', hair_style: 'short', hair_color: '#555555', eye_style: 'round', eye_color: '#808080', mouth_style: 'neutral', accessory: 'none' },
-  { face_shape: 'oval', skin_color: '#d4a373', hair_style: 'curly', hair_color: '#333333', eye_style: 'almond', eye_color: '#4a3728', mouth_style: 'smile', accessory: 'none' },
-  { face_shape: 'square', skin_color: '#f5d0c5', hair_style: 'long', hair_color: '#8b4513', eye_style: 'wide', eye_color: '#1e90ff', mouth_style: 'small', accessory: 'glasses' },
-  { face_shape: 'heart', skin_color: '#c68642', hair_style: 'ponytail', hair_color: '#2c1810', eye_style: 'narrow', eye_color: '#228b22', mouth_style: 'grin', accessory: 'none' },
-  { face_shape: 'round', skin_color: '#8d5524', hair_style: 'mohawk', hair_color: '#222222', eye_style: 'round', eye_color: '#4a3728', mouth_style: 'neutral', accessory: 'hat' },
+  { face_shape: 'round', skin_color: '#e8beac', hair_style: 'short', hair_color: '#4a3728', eye_style: 'round', eye_color: '#4a3728', mouth_style: 'smile', accessory: 'none' },
+  { face_shape: 'oval', skin_color: '#d4a373', hair_style: 'curly', hair_color: '#1a1a1a', eye_style: 'almond', eye_color: '#4a3728', mouth_style: 'smile', accessory: 'none' },
+  { face_shape: 'square', skin_color: '#f5d0c5', hair_style: 'long', hair_color: '#8b4513', eye_style: 'wide', eye_color: '#1e90ff', mouth_style: 'grin', accessory: 'glasses' },
+  { face_shape: 'heart', skin_color: '#c68642', hair_style: 'ponytail', hair_color: '#2c1810', eye_style: 'almond', eye_color: '#228b22', mouth_style: 'smile', accessory: 'none' },
+  { face_shape: 'round', skin_color: '#8d5524', hair_style: 'short', hair_color: '#222222', eye_style: 'round', eye_color: '#4a3728', mouth_style: 'grin', accessory: 'none' },
+  { face_shape: 'oval', skin_color: '#f5d0c5', hair_style: 'curly', hair_color: '#b8860b', eye_style: 'wide', eye_color: '#1e90ff', mouth_style: 'smile', accessory: 'sunglasses' },
+  { face_shape: 'round', skin_color: '#e8beac', hair_style: 'long', hair_color: '#222222', eye_style: 'almond', eye_color: '#4a3728', mouth_style: 'small', accessory: 'earring' },
+  { face_shape: 'heart', skin_color: '#d4a373', hair_style: 'mohawk', hair_color: '#8b0000', eye_style: 'narrow', eye_color: '#228b22', mouth_style: 'grin', accessory: 'none' },
+  { face_shape: 'square', skin_color: '#c68642', hair_style: 'short', hair_color: '#333333', eye_style: 'round', eye_color: '#4a3728', mouth_style: 'smile', accessory: 'hat' },
+  { face_shape: 'oval', skin_color: '#8d5524', hair_style: 'ponytail', hair_color: '#1a1a1a', eye_style: 'wide', eye_color: '#1e90ff', mouth_style: 'smile', accessory: 'none' },
 ];
 
 const DRIFTER_LIFESPAN_MS = 2 * 60 * 1000; // 2 minutes (demo: faster turnover)
@@ -187,86 +472,25 @@ const DRIFTER_SEED_CLUSTERS = [
 ];
 
 /**
- * Build a topic affinity profile for a bot.
- * Opinionated bots: heavy seed weights so they almost never stray.
- * Drifter bots: no seed, purely learned from likes (starts blank).
- */
-async function getBotTopicProfile(
-  botId: string,
-  persona: { hashtags: string[] } | null,
-  isOpinionated: boolean
-): Promise<Map<string, number>> {
-  const topicCounts = new Map<string, number>();
-
-  // Opinionated bots get very high seed weights so they stay in their lane
-  // Demo: use canonical topics only
-  if (isOpinionated && persona) {
-    persona.hashtags.forEach(tag => {
-      const canonical = normalizeToCanonical(tag);
-      topicCounts.set(canonical, 15); // Increased from 10 for stronger echo chambers
-    });
-  }
-
-  // Layer on exposure memory (drifters only) — repeated viewing builds preference
-  // Demo: normalize to canonical
-  if (!isOpinionated) {
-    const exposure = drifterExposure.get(botId);
-    if (exposure) {
-      exposure.forEach((impressions, tag) => {
-        const canonical = normalizeToCanonical(tag);
-        // Each impression is worth 2 weight (increased from 1 for faster clustering)
-        topicCounts.set(canonical, (topicCounts.get(canonical) || 0) + impressions * 2);
-      });
-    }
-  }
-
-  // Layer on learned preferences from past likes
-  // Demo: normalize to canonical
-  const { data: likes } = await supabase
-    .from('likes')
-    .select('post_id, posts(topic_tags)')
-    .eq('user_id', botId);
-
-  if (likes) {
-    likes.forEach(like => {
-      const post = like.posts as unknown as { topic_tags: string[] } | null;
-      if (post?.topic_tags) {
-        post.topic_tags.forEach(tag => {
-          const canonical = normalizeToCanonical(tag);
-          // Likes are worth more than impressions — active engagement reinforces
-          const w = isOpinionated ? 2 : 5; // Increased for demo
-          topicCounts.set(canonical, (topicCounts.get(canonical) || 0) + w);
-        });
-      }
-    });
-  }
-
-  return topicCounts;
-}
-
-/**
- * Same aggressive affinity/recommendation algorithm as the user Feed.
- * Scores posts by how well their tags match the bot's topic profile,
- * then sorts so the bot sees (and likes) echo-chamber-aligned content.
- * This pulls drifters into echo chambers FAST.
+ * Feed recommendation: scores posts by attraction overlap.
+ * This is the ONLY algorithm — works for ALL agents.
  */
 function getRecommendedPosts(
   posts: { id: string; topic_tags: string[]; user_id: string }[],
-  topicProfile: Map<string, number>,
-  botId: string
+  agentId: string
 ): { id: string; topic_tags: string[]; affinity: number }[] {
-  // Filter out own posts
-  const candidates = posts.filter(p => p.user_id !== botId);
+  const candidates = posts.filter(p => p.user_id !== agentId);
+  const attraction = getAgentTopicProfile(agentId);
 
-  if (topicProfile.size === 0) {
-    // No preferences yet - return all with equal affinity
+  if (attraction.size === 0) {
+    // No preferences yet - equal affinity
     return candidates.map(p => ({ ...p, affinity: 1 }));
   }
 
-  const maxWeight = Math.max(...topicProfile.values(), 1);
-  const totalExposure = Array.from(topicProfile.values()).reduce((a, b) => a + b, 0);
-  // Echo kicks in aggressively after just 3 total exposure points (reduced from 5 for demo)
-  const echoStrength = Math.min(totalExposure / 3, 1);
+  const maxAttraction = Math.max(...Array.from(attraction.values()).filter(v => v > 0), 1);
+  const totalAttraction = Array.from(attraction.values()).reduce((a, b) => a + b, 0);
+  // Echo strength ramps up quickly
+  const echoStrength = Math.min(totalAttraction / 3, 1);
 
   const scored = candidates.map(post => {
     const tags = post.topic_tags || [];
@@ -274,53 +498,44 @@ function getRecommendedPosts(
     let hasMatchingTag = false;
 
     for (const tag of tags) {
-      // Demo: normalize to canonical before matching
       const canonical = normalizeToCanonical(tag);
-      const weight = topicProfile.get(canonical) || 0;
-      if (weight > 0) hasMatchingTag = true;
-      score += weight;
+      const attractionWeight = attraction.get(`topic:${canonical}`) || 0;
+      if (attractionWeight > 0) hasMatchingTag = true;
+      score += attractionWeight;
     }
 
-    // Normalize
-    const maxPossible = maxWeight * Math.max(tags.length, 1);
-    const normalized = maxPossible > 0 ? score / maxPossible : 0;
-
-    // Non-matching content gets heavily suppressed
+    // Non-matching content gets suppressed
     if (!hasMatchingTag) {
       const baseVisibility = Math.max(0.1, 0.5 * (1 - echoStrength));
       return { id: post.id, topic_tags: post.topic_tags, affinity: baseVisibility };
     }
 
-    // Matching content gets boosted
+    // Normalize and boost matching content
+    const maxPossible = maxAttraction * Math.max(tags.length, 1);
+    const normalized = maxPossible > 0 ? score / maxPossible : 0;
     const boost = 0.6 + (normalized * 0.4);
     const affinity = Math.min(1, boost + (echoStrength * 0.15));
 
     return { id: post.id, topic_tags: post.topic_tags, affinity };
   });
 
-  // Sort by affinity descending - matching content floats to top
   scored.sort((a, b) => b.affinity - a.affinity);
-
   return scored;
 }
 
 // ── Drifter bot management ─────────────────────────────────────────────────
 const activeDrifters = new Set<string>(); // track drifter IDs for liking loop
 
-// In-memory exposure memory: tracks which topics a drifter has been *shown*
-// by the recommendation algorithm. This simulates the real echo-chamber
-// mechanism — you don't need to like something for it to shape your worldview;
-// mere repeated exposure builds familiarity and preference.
-const drifterExposure = new Map<string, Map<string, number>>();
+// No more drifterExposure — attraction IS the memory
 
 async function spawnDrifters(): Promise<void> {
   const now = new Date().toISOString();
 
-  // Query the DB for currently alive drifters to get the real count
+  // Query the DB for currently alive drifters (identified by having expires_at)
   const { data: liveDrifters } = await supabase
     .from('users')
     .select('id')
-    .eq('is_bot', true)
+    .not('expires_at', 'is', null)
     .gt('expires_at', now);
 
   const liveCount = liveDrifters?.length ?? 0;
@@ -339,7 +554,7 @@ async function spawnDrifters(): Promise<void> {
 
   for (let i = 0; i < count; i++) {
     const name = DRIFTER_NAMES[Math.floor(Math.random() * DRIFTER_NAMES.length)] +
-      '_' + Math.floor(Math.random() * 1000);
+      '_' + Math.floor(Math.random() * 100);
     const avatar = DRIFTER_AVATAR_CONFIGS[Math.floor(Math.random() * DRIFTER_AVATAR_CONFIGS.length)];
     const expiresAt = new Date(Date.now() + DRIFTER_LIFESPAN_MS).toISOString();
 
@@ -348,7 +563,7 @@ async function spawnDrifters(): Promise<void> {
       .insert({
         display_name: name,
         avatar_config: avatar,
-        is_bot: true,
+        is_bot: false, // Drifters look like real users
         expires_at: expiresAt,
       })
       .select('id')
@@ -357,31 +572,42 @@ async function spawnDrifters(): Promise<void> {
     if (!error && data) {
       activeDrifters.add(data.id);
 
-      // Give this drifter a random seed preference toward one echo chamber
-      // Demo: canonical topics only, stronger seed for faster clustering
+      // Seed drifter with initial attraction toward one cluster
+      // This is the SAME mechanism as everyone else, just initialized
       const seedCluster = DRIFTER_SEED_CLUSTERS[Math.floor(Math.random() * DRIFTER_SEED_CLUSTERS.length)];
-      const seedExposure = new Map<string, number>();
-      seedCluster.forEach(tag => {
-        // Strong initial seed (12-18 points, increased from 8-12) so they drift toward this cluster fast
-        seedExposure.set(tag, 12 + Math.floor(Math.random() * 7));
-      });
-      drifterExposure.set(data.id, seedExposure);
+      await Promise.all(seedCluster.map(tag => 
+        updateAttraction(data.id, `topic:${tag}`, 12 + Math.floor(Math.random() * 7))
+      ));
 
-      console.log(`Drifter "${name}" spawned, seeded toward: ${seedCluster[0]}`);
+      // Immediately like 2-4 posts matching their seed cluster
+      const seedTopic = seedCluster[0];
+      const { data: seedPosts } = await supabase
+        .from('posts')
+        .select('id, topic_tags')
+        .contains('topic_tags', [seedTopic])
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (seedPosts?.length) {
+        const shuffled = seedPosts.sort(() => Math.random() - 0.5);
+        const toLike = shuffled.slice(0, 2 + Math.floor(Math.random() * 3));
+        for (const post of toLike) {
+          await supabase
+            .from('likes')
+            .upsert({ user_id: data.id, post_id: post.id });
+        }
+        console.log(`"${name}" joined, interested in #${seedTopic} (liked ${toLike.length} posts)`);
+      } else {
+        console.log(`"${name}" joined, interested in #${seedTopic} (no posts to like yet)`);
+      }
     }
   }
 }
 
 /**
- * Make a drifter bot like a post. Drifters start with no opinions —
- * they build preferences from what the algorithm shows them (exposure)
- * and what they choose to like (engagement). This two-layer feedback
- * loop pulls them into echo chambers organically:
- *   see topic → familiarity grows → algo shows more → like it → preference locks in
+ * Drifter engages with content. Uses unified attraction-based feed.
  */
 async function runDrifterLike(drifterId: string): Promise<void> {
-  const topicProfile = await getBotTopicProfile(drifterId, null, false);
-
   const { data: recentPosts } = await supabase
     .from('posts')
     .select('id, topic_tags, user_id')
@@ -398,36 +624,44 @@ async function runDrifterLike(drifterId: string): Promise<void> {
 
   const alreadyLiked = new Set((existingLikes || []).map(l => l.post_id));
 
-  const recommended = getRecommendedPosts(recentPosts, topicProfile, drifterId)
+  const recommended = getRecommendedPosts(recentPosts, drifterId)
     .filter(p => !alreadyLiked.has(p.id));
 
   if (recommended.length === 0) return;
 
-  // ── Record exposure: the top posts the algo "showed" this drifter ──
-  // Even without liking, seeing the same topics repeatedly builds familiarity
-  // Demo: normalize all tags to canonical for faster echo chamber formation
-  const exposure = drifterExposure.get(drifterId) || new Map<string, number>();
-  const feedSlice = recommended.slice(0, 10); // top 10 = their "feed"
+  // ── Record exposure: mere viewing updates attraction ──
+  const feedSlice = recommended.slice(0, 10);
+  const exposureUpdates: Promise<void>[] = [];
   for (const post of feedSlice) {
     if (post.topic_tags) {
-      for (const tag of post.topic_tags) {
-        const canonical = normalizeToCanonical(tag);
-        exposure.set(canonical, (exposure.get(canonical) || 0) + 1);
-      }
+      post.topic_tags.forEach(tag => {
+        const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+        // Reduced exposure: passive viewing should not dominate intent
+        exposureUpdates.push(updateAttraction(drifterId, `topic:${canonical}`, 0.02));
+      });
     }
   }
-  drifterExposure.set(drifterId, exposure);
+  await Promise.all(exposureUpdates);
 
-  // ── Pick a post to like (weighted random by affinity) ──
-  const totalAffinity = recommended.reduce((sum, p) => sum + p.affinity, 0);
-  let rand = Math.random() * totalAffinity;
-  let chosen = recommended[0];
+  // ── Pick a post to like (ε-greedy: exploit strongest pull 70% of time) ──
+  // This makes echo chamber "lock-in" visibly deterministic
+  let chosen: typeof recommended[0];
+  
+  if (Math.random() < 0.7) {
+    // Exploit: pick strongest affinity (echo chamber reinforcement)
+    chosen = recommended[0]; // Already sorted by affinity in getRecommendedPosts
+  } else {
+    // Explore: weighted random (allows discovery)
+    const totalAffinity = recommended.reduce((sum, p) => sum + p.affinity, 0);
+    let rand = Math.random() * totalAffinity;
+    chosen = recommended[0];
 
-  for (const post of recommended) {
-    rand -= post.affinity;
-    if (rand <= 0) {
-      chosen = post;
-      break;
+    for (const post of recommended) {
+      rand -= post.affinity;
+      if (rand <= 0) {
+        chosen = post;
+        break;
+      }
     }
   }
 
@@ -436,14 +670,30 @@ async function runDrifterLike(drifterId: string): Promise<void> {
     .upsert({ user_id: drifterId, post_id: chosen.id });
 
   if (!error) {
-    const topTags = Array.from(exposure.entries())
+    // ── Step 3: Likes = strong attraction ──
+    const likeUpdates: Promise<void>[] = [];
+    for (const tag of chosen.topic_tags || []) {
+      const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+      likeUpdates.push(updateAttraction(drifterId, `topic:${canonical}`, 1.0));
+    }
+
+    // User-to-user attraction (sub-clusters)
+    const postAuthor = recentPosts.find(p => p.id === chosen.id)?.user_id;
+    if (postAuthor) {
+      likeUpdates.push(updateAttraction(drifterId, postAuthor, 0.3)); // Social gravity
+    }
+    await Promise.all(likeUpdates);
+
+    const attraction = getAgentTopicProfile(drifterId);
+    const topTopics = Array.from(attraction.entries())
+      .filter(([id]) => id.startsWith('topic:'))
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
-      .map(([t, c]) => `${t}(${c})`);
+      .map(([id, w]) => `${id.slice(6)}(${w.toFixed(1)})`);
     console.log(
-      `Drifter liked post (affinity: ${chosen.affinity.toFixed(2)}, ` +
+      `Drifter liked (affinity: ${chosen.affinity.toFixed(2)}, ` +
       `tags: ${chosen.topic_tags?.join(', ')}, ` +
-      `top exposure: ${topTags.join(', ')})`
+      `attraction: ${topTopics.join(', ')})`
     );
   }
 }
@@ -471,6 +721,18 @@ export async function runBot(): Promise<boolean> {
       return false;
     }
 
+    // Seed opinionated bot attraction ONCE (not every cycle)
+    // Check if already seeded to prevent infinite gravity wells
+    const botProfile = attractionGraph.get(bot.id);
+    const needsSeeding = !botProfile || persona.hashtags.some(tag => !botProfile.has(`topic:${tag}`));
+    
+    if (needsSeeding) {
+      // High initial values = ideological gravity wells
+      await Promise.all(persona.hashtags.map(tag => 
+        updateAttraction(bot.id, `topic:${tag}`, 8.0) // Strong initial identity
+      ));
+    }
+
     // Pick a random template
     const content = persona.templates[Math.floor(Math.random() * persona.templates.length)];
 
@@ -494,11 +756,15 @@ export async function runBot(): Promise<boolean> {
       return false;
     }
 
+    // ── Step 5: Opinionated bots as gravity wells ──
+    // Posts reinforce ideology more gently (likes do the heavy lifting)
+    await Promise.all(topicTags.map(tag => 
+      updateAttraction(bot.id, `topic:${tag}`, 1.5)
+    ));
+
     console.log(`Bot ${bot.display_name} posted: ${content.slice(0, 50)}...`);
 
-    // Opinionated bots ALWAYS try to like (strongly biased toward their topics)
-    const topicProfile = await getBotTopicProfile(bot.id, persona, true);
-
+    // Opinionated bots like content aligned with their ideology
     const { data: recentPosts } = await supabase
       .from('posts')
       .select('id, topic_tags, user_id')
@@ -514,8 +780,7 @@ export async function runBot(): Promise<boolean> {
 
       const alreadyLiked = new Set((existingLikes || []).map(l => l.post_id));
 
-      // Only consider posts that share at least one topic
-      const recommended = getRecommendedPosts(recentPosts, topicProfile, bot.id)
+      const recommended = getRecommendedPosts(recentPosts, bot.id)
         .filter(p => !alreadyLiked.has(p.id))
         .filter(p => p.affinity > 0.3); // Demo: less picky (was 0.6), more echo chambering
 
@@ -548,11 +813,9 @@ export async function runBot(): Promise<boolean> {
 async function cleanupExpiredDrifters(): Promise<void> {
   const now = new Date().toISOString();
 
-  // Delete all expired drifters from DB (cascade removes likes/posts)
   const { data: deleted, error } = await supabase
     .from('users')
     .delete()
-    .eq('is_bot', true)
     .not('expires_at', 'is', null)
     .lt('expires_at', now)
     .select('id, display_name');
@@ -560,7 +823,8 @@ async function cleanupExpiredDrifters(): Promise<void> {
   if (!error && deleted && deleted.length > 0) {
     deleted.forEach(d => {
       activeDrifters.delete(d.id);
-      drifterExposure.delete(d.id);
+      // Clean up attraction state
+      attractionGraph.delete(d.id);
       console.log(`Cleaned up expired drifter: ${d.display_name}`);
     });
   }
@@ -571,8 +835,16 @@ let botInterval: number | null = null;
 let drifterSpawnInterval: number | null = null;
 let drifterLikeInterval: number | null = null;
 let cleanupInterval: number | null = null;
+let decayInterval: number | null = null;
 
 export function startBotLoop() {
+  if (botInterval) return;
+
+  // Initialize attraction graph from database FIRST
+  initializeAttractionGraph().then(() => {
+    console.log('Attraction graph ready');
+  });
+
   if (botInterval) return;
 
   // Opinionated bot posting loop (8-15s - demo: very active)
@@ -605,9 +877,22 @@ export function startBotLoop() {
     for (const drifterId of drifterIds) {
       if (Math.random() < 0.9) {
         await runDrifterLike(drifterId);
+        // Decay drifter attractions slightly after each action to prevent unbounded growth
+        decayAttraction(drifterId, 0.99);
       }
     }
   }, 1500);
+
+  // Global decay for all agents every 30s to prevent attraction explosion
+  // Bots decay very lightly (0.995), drifters more (0.98), humans moderately (0.99)
+  decayInterval = window.setInterval(() => {
+    for (const [agentId] of attractionGraph) {
+      // Check if it's a bot (UUID format check would be more robust)
+      const isDrifter = activeDrifters.has(agentId);
+      const decayFactor = isDrifter ? 0.98 : 0.99;
+      decayAttraction(agentId, decayFactor);
+    }
+  }, 30000);
 }
 
 export function stopBotLoop() {
@@ -627,7 +912,19 @@ export function stopBotLoop() {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
   }
+  if (decayInterval) {
+    clearInterval(decayInterval);
+    decayInterval = null;
+  }
+  if (flushTimeout) {
+    clearTimeout(flushTimeout);
+    flushTimeout = null;
+  }
+  
+  // Flush any pending attraction updates before stopping
+  flushAttractionUpdates();
+  
   activeDrifters.clear();
-  drifterExposure.clear();
+  attractionGraph.clear();
   console.log('Bot loop stopped');
 }

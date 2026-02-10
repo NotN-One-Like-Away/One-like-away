@@ -16,6 +16,7 @@ interface GraphNode {
   avatar_config: AvatarConfig | null;
   cluster?: string;
   clusterColor?: string;
+  lockedCluster?: string; // For cluster inertia/hysteresis
   x?: number;
   y?: number;
   vx?: number;
@@ -95,6 +96,34 @@ const normalize = (t: string): string => {
   const lower = t.toLowerCase().replace(/^#/, '');
   return TOPIC_TO_CLUSTER[lower] || lower;
 };
+
+/**
+ * Determine dominant cluster with hysteresis to prevent oscillation.
+ * Requires a clear leader (dominanceRatio × second place) to assign identity.
+ * Returns 'neutral' for ties or weak signals.
+ */
+function getDominantCluster(
+  profile: Map<string, number> | undefined,
+  dominanceRatio = 2.5
+): string {
+  if (!profile || profile.size === 0) return 'neutral';
+
+  const entries = Array.from(profile.entries())
+    .filter(([k]) => CANONICAL_CLUSTER_COLORS[k])
+    .sort((a, b) => b[1] - a[1]);
+
+  if (entries.length === 0) return 'neutral';
+  if (entries.length === 1) return entries[0][0];
+
+  const [top, second] = entries;
+
+  // Require clear dominance to avoid flip-flopping
+  if (top[1] >= second[1] * dominanceRatio) {
+    return top[0];
+  }
+
+  return 'neutral';
+}
 
 /** Cosine similarity on two topic-weight maps */
 const similarity = (a: Map<string, number>, b: Map<string, number>): number => {
@@ -268,47 +297,31 @@ export function Graph() {
       .select('id, display_name, avatar_config, is_bot, expires_at')
       .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
 
-    const [{ data: likes }, { data: allPosts }] = await Promise.all([
-      supabase.from('likes').select('user_id, posts(topic_tags)'),
-      supabase.from('posts').select('user_id, topic_tags'),
-    ]);
+    const { data: attractions } = await supabase
+      .from('attractions')
+      .select('source_id, target_id, weight');
 
     if (!users) return;
 
-    // Build topic profiles from BOTH posts (what they produce) AND likes (what they consume)
-    // This ensures bots always have a profile even before they've liked anything
+    // Build topic profiles from attractions table (single source of truth)
     const profiles = new Map<string, Map<string, number>>();
-    // Separate likes-only profile — this determines cluster assignment.
-    // Users get pulled to the echo chamber they LIKED the most, not what they posted about.
     const likeProfiles = new Map<string, Map<string, number>>();
 
-    // 1. Posts: what each user produces (critical for bots as cluster anchors)
-    allPosts?.forEach(p => {
-      const tags = p.topic_tags as string[] | null;
-      if (!tags || tags.length === 0) return;
-      if (!profiles.has(p.user_id)) profiles.set(p.user_id, new Map());
-      const m = profiles.get(p.user_id)!;
-      tags.forEach(t => {
-        const k = normalize(t);
-        m.set(k, (m.get(k) || 0) + 1);
-      });
+    attractions?.forEach(a => {
+      if (!profiles.has(a.source_id)) profiles.set(a.source_id, new Map());
+      const userProfile = profiles.get(a.source_id)!;
+      
+      // Extract topic from target_id (format: "topic:{canonical}")
+      if (a.target_id.startsWith('topic:')) {
+        const topic = a.target_id.slice(6);
+        userProfile.set(topic, a.weight);
+        
+        // For cluster assignment, track in likes profile too
+        if (!likeProfiles.has(a.source_id)) likeProfiles.set(a.source_id, new Map());
+        likeProfiles.get(a.source_id)!.set(topic, a.weight);
+      }
     });
 
-    // 2. Likes: what each user consumes (drives real user clustering)
-    likes?.forEach(l => {
-      const tags = (l.posts as unknown as { topic_tags: string[] } | null)?.topic_tags;
-      if (!tags) return;
-      if (!profiles.has(l.user_id)) profiles.set(l.user_id, new Map());
-      const m = profiles.get(l.user_id)!;
-      // Also track in likes-only profile
-      if (!likeProfiles.has(l.user_id)) likeProfiles.set(l.user_id, new Map());
-      const lm = likeProfiles.get(l.user_id)!;
-      tags.forEach(t => {
-        const k = normalize(t);
-        m.set(k, (m.get(k) || 0) + 1);
-        lm.set(k, (lm.get(k) || 0) + 1);
-      });
-    });
     topicsRef.current = profiles;
     likeTopicsRef.current = likeProfiles;
 
@@ -317,19 +330,31 @@ export function Graph() {
     const graphNodes: GraphNode[] = users.map(u => {
       const old = prevMap.get(u.id);
 
-      // For cluster assignment: use LIKES-ONLY profile so users get pulled
-      // to the echo chamber they liked the most posts about.
-      // Bots without likes fall back to their post profile (they're anchors).
-      const clusterProfile = likeProfiles.get(u.id) || (u.is_bot ? profiles.get(u.id) : undefined);
+      // MANDATORY: use LIKES-ONLY profile for cluster identity
+      // No fallback to exposure/profiles - if no likes, stay neutral
+      // This prevents bots/exposure from creating false identity
+      const clusterProfile = likeProfiles.get(u.id);
 
-      let maxCluster = 'neutral', maxCount = 0;
-      if (clusterProfile && clusterProfile.size > 0) {
-        clusterProfile.forEach((count, cluster) => {
-          if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
-            maxCount = count;
-            maxCluster = cluster;
-          }
-        });
+      // Use dominant cluster detection with hysteresis
+      const newCluster = getDominantCluster(clusterProfile);
+      const prevCluster = old?.lockedCluster || 'neutral';
+      
+      // Cluster inertia: only change if new cluster is strong and different
+      let finalCluster: string;
+      let lockedCluster: string;
+      
+      if (newCluster !== 'neutral' && newCluster !== prevCluster) {
+        // Entering or switching chamber - accept if dominant
+        lockedCluster = newCluster;
+        finalCluster = newCluster;
+      } else if (newCluster === 'neutral' && prevCluster !== 'neutral') {
+        // Don't immediately lose chamber identity on weak signal
+        lockedCluster = prevCluster;
+        finalCluster = prevCluster;
+      } else {
+        // Stable state
+        lockedCluster = prevCluster;
+        finalCluster = prevCluster;
       }
 
       return {
@@ -337,8 +362,9 @@ export function Graph() {
         name: u.display_name,
         is_bot: u.is_bot,
         avatar_config: u.avatar_config,
-        cluster: maxCluster,
-        clusterColor: CANONICAL_CLUSTER_COLORS[maxCluster] || '#6b7280',
+        cluster: finalCluster,
+        clusterColor: CANONICAL_CLUSTER_COLORS[finalCluster] || '#6b7280',
+        lockedCluster: lockedCluster,
         x: old?.x ?? (Math.random() - 0.5) * 800,
         y: old?.y ?? (Math.random() - 0.5) * 800,
         vx: clamp(old?.vx || 0),
@@ -465,9 +491,9 @@ export function Graph() {
 
           // Pull strength: stronger when far away (helps initial placement),
           // constant minimum so nodes stay trapped inside the basin.
-          const basePull = n.is_bot ? 0.15 : 0.10;
+          const basePull = n.is_bot ? 0.25 : 0.35;
           // Ramp up pull for nodes far from their hotspot (> 150px)
-          const distFactor = dist > 150 ? 1 + (dist - 150) * 0.002 : 1;
+          const distFactor = dist > 150 ? 1 + (dist - 150) * 0.005 : 1;
           const strength = basePull * distFactor;
 
           const nx = dx / dist;
@@ -493,70 +519,81 @@ export function Graph() {
     fetchGraphData();
     startBotLoop();
 
-    // Real-time: incremental topic update on new likes
+    // Real-time updates: watch for data changes
     const channel = supabase
       .channel('graph-live')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'likes' }, async (payload) => {
-        // Fetch the post's topic tags for this like
-        const like = payload.new as { user_id: string; post_id: string };
-        const { data: post } = await supabase
-          .from('posts')
-          .select('topic_tags')
-          .eq('id', like.post_id)
-          .single();
-
-        if (post?.topic_tags) {
-          // Incrementally update the combined topic map
-          if (!topicsRef.current.has(like.user_id)) {
-            topicsRef.current.set(like.user_id, new Map());
-          }
-          const m = topicsRef.current.get(like.user_id)!;
-
-          // Also update the likes-only topic map (used for cluster assignment)
-          if (!likeTopicsRef.current.has(like.user_id)) {
-            likeTopicsRef.current.set(like.user_id, new Map());
-          }
-          const lm = likeTopicsRef.current.get(like.user_id)!;
-
-          post.topic_tags.forEach((t: string) => {
-            const k = normalize(t);
-            m.set(k, (m.get(k) || 0) + 1);
-            lm.set(k, (lm.get(k) || 0) + 1);
-          });
-
-          // Update node's cluster based on LIKES only (what they consumed)
-          const node = nodesRef.current.find(n => n.id === like.user_id);
-          if (node) {
-            let maxCluster = 'neutral', maxCount = 0;
-            lm.forEach((count, cluster) => {
-              if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
-                maxCount = count; maxCluster = cluster;
-              }
-            });
-            node.cluster = maxCluster;
-            node.clusterColor = CANONICAL_CLUSTER_COLORS[maxCluster] || '#6b7280';
-            // Trigger React re-render so the graph picks up the new cluster
-            setNodes(prev => [...prev]);
-          } else {
-            // Node not found yet (race condition) — full refetch will pick it up
-            fetchGraphData();
-          }
-
-          graphRef.current?.d3ReheatSimulation();
-          updateClusterPositions();
-        }
-      })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, () => {
         // Full refetch on user add/remove (topology change)
         fetchGraphData();
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'attractions' }, async (payload) => {
+        // Real-time attraction updates - update data structures only, defer UI updates to polling interval
+        const attraction = payload.new as { source_id: string; target_id: string; weight: number };
+        
+        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+          // Update botRunner's attraction graph in real-time
+          const { getAllAttractions } = await import('../lib/botRunner');
+          const attractionGraph = getAllAttractions();
+          
+          if (!attractionGraph.has(attraction.source_id)) {
+            attractionGraph.set(attraction.source_id, new Map());
+          }
+          attractionGraph.get(attraction.source_id)!.set(attraction.target_id, attraction.weight);
+          
+          // Update local topic profiles if it's a topic attraction
+          if (attraction.target_id.startsWith('topic:')) {
+            const topic = attraction.target_id.slice(6);
+            
+            if (!topicsRef.current.has(attraction.source_id)) {
+              topicsRef.current.set(attraction.source_id, new Map());
+            }
+            topicsRef.current.get(attraction.source_id)!.set(topic, attraction.weight);
+            
+            if (!likeTopicsRef.current.has(attraction.source_id)) {
+              likeTopicsRef.current.set(attraction.source_id, new Map());
+            }
+            likeTopicsRef.current.get(attraction.source_id)!.set(topic, attraction.weight);
+            
+            // Update node's cluster (in nodesRef only, no UI update)
+            const node = nodesRef.current.find(n => n.id === attraction.source_id);
+            if (node) {
+              const lm = likeTopicsRef.current.get(attraction.source_id)!;
+              
+              // Use dominant cluster detection with hysteresis
+              const newCluster = getDominantCluster(lm);
+              const prevCluster = node.lockedCluster || 'neutral';
+              
+              // Cluster inertia: only update if strong signal
+              if (newCluster !== 'neutral' && newCluster !== prevCluster) {
+                node.lockedCluster = newCluster;
+                node.cluster = newCluster;
+                node.clusterColor = CANONICAL_CLUSTER_COLORS[newCluster] || '#6b7280';
+                console.log(`🔄 ${node.name}: ${topic}=${attraction.weight.toFixed(1)} → cluster: ${prevCluster} → ${newCluster}`);
+              } else if (newCluster === 'neutral' && prevCluster !== 'neutral') {
+                // Keep previous cluster on weak signal
+                node.cluster = prevCluster;
+                node.clusterColor = CANONICAL_CLUSTER_COLORS[prevCluster] || '#6b7280';
+              }
+              
+              // Let the 3s UI sync interval handle renders
+            }
+          }
+        }
+      })
       .subscribe();
 
-    // Periodic full refresh for link/cluster recalculation
-    const poll = setInterval(fetchGraphData, 8000);
+    // Periodic full refresh - reduced from 8s to 15s
+    const poll = setInterval(fetchGraphData, 15000);
 
-    // Cluster position update timer
-    const clusterPoll = setInterval(updateClusterPositions, 500);
+    // Cluster position update - reduced from 500ms to 2s
+    const clusterPoll = setInterval(updateClusterPositions, 2000);
+
+    // Periodic UI sync to reflect real-time cluster changes without full refetch
+    // This batches UI updates from real-time attraction changes every 3 seconds
+    const uiSyncPoll = setInterval(() => {
+      setNodes([...nodesRef.current]);
+      graphRef.current?.d3ReheatSimulation();
+    }, 3000);
 
     const handleResize = () => setDimensions({ width: window.innerWidth, height: window.innerHeight });
     window.addEventListener('resize', handleResize);
@@ -566,6 +603,7 @@ export function Graph() {
       supabase.removeChannel(channel);
       clearInterval(poll);
       clearInterval(clusterPoll);
+      clearInterval(uiSyncPoll);
       window.removeEventListener('resize', handleResize);
     };
   }, [fetchGraphData, updateClusterPositions]);
@@ -681,8 +719,16 @@ export function Graph() {
         }}
         linkColor={(link) => {
           const s = (link as GraphLink).strength;
-          const opacity = Math.min(0.4, s * 0.5);
-          return `rgba(99, 102, 241, ${opacity})`;
+          const opacity = Math.min(0.5, s * 0.6);
+          // Color links by the cluster of the source node (falls back to indigo)
+          const src = (link as any).source;
+          const srcNode = typeof src === 'object' ? src as GraphNode : null;
+          const clusterColor = srcNode?.clusterColor || '#6366f1';
+          // Parse hex to rgb for opacity
+          const r = parseInt(clusterColor.slice(1, 3), 16);
+          const g = parseInt(clusterColor.slice(3, 5), 16);
+          const b = parseInt(clusterColor.slice(5, 7), 16);
+          return `rgba(${r}, ${g}, ${b}, ${opacity})`;
         }}
         linkWidth={(link) => Math.min((link as GraphLink).strength * 2.5, 3)}
         d3AlphaDecay={0.005}
