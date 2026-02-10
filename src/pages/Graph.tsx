@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase } from '../lib/supabase';
+import { startBotLoop, stopBotLoop } from '../lib/botRunner';
 import type { User } from '../types';
 
 interface GraphNode {
@@ -172,11 +173,15 @@ export function Graph() {
   useEffect(() => {
     fetchGraphData();
 
+    // Start bot activity when graph is displayed
+    startBotLoop();
+
     // Subscribe to realtime updates
     const channel = supabase
       .channel('graph-updates')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, fetchGraphData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, fetchGraphData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, fetchGraphData)
       .subscribe();
 
     const handleResize = () => {
@@ -186,6 +191,7 @@ export function Graph() {
     window.addEventListener('resize', handleResize);
 
     return () => {
+      stopBotLoop();
       supabase.removeChannel(channel);
       window.removeEventListener('resize', handleResize);
     };
