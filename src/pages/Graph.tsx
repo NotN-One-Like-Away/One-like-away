@@ -250,6 +250,71 @@ export function Graph() {
     setClusters(clusterInfos);
   }, [nodes]);
 
+  // Apply custom forces when graph data changes
+  useEffect(() => {
+    if (!graphRef.current || nodes.length === 0) return;
+
+    const fg = graphRef.current;
+
+    // Stronger repulsion between all nodes (spread them out)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const charge = fg.d3Force('charge') as any;
+    if (charge?.strength) charge.strength(-400);
+
+    // Weaker link force so clusters can form more naturally
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const link = fg.d3Force('link') as any;
+    if (link?.distance) link.distance(120);
+
+    // Custom clustering force - attract same cluster, repel different
+    fg.d3Force('cluster', (alpha: number) => {
+      const clusterStrength = 0.2;
+      const repelStrength = 0.08;
+
+      nodes.forEach((node) => {
+        if (!node.cluster || node.x === undefined || node.y === undefined) return;
+
+        nodes.forEach((other) => {
+          if (node.id === other.id || other.x === undefined || other.y === undefined) return;
+
+          const dx = (other.x ?? 0) - (node.x ?? 0);
+          const dy = (other.y ?? 0) - (node.y ?? 0);
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+          if (node.cluster === other.cluster) {
+            // Same cluster - attract (but not too close)
+            if (dist > 100) {
+              const force = alpha * clusterStrength;
+              node.vx = (node.vx || 0) + (dx / dist) * force;
+              node.vy = (node.vy || 0) + (dy / dist) * force;
+            }
+          } else if (other.cluster) {
+            // Different clusters - repel
+            if (dist < 250) {
+              const force = alpha * repelStrength * (250 - dist) / 250;
+              node.vx = (node.vx || 0) - (dx / dist) * force;
+              node.vy = (node.vy || 0) - (dy / dist) * force;
+            }
+          }
+        });
+      });
+    });
+
+    // Reheat simulation to apply new forces
+    fg.d3ReheatSimulation();
+  }, [nodes]);
+
+  // Keep simulation alive with gentle perturbations ("breathing")
+  useEffect(() => {
+    const breatheInterval = setInterval(() => {
+      if (graphRef.current && nodes.length > 0) {
+        graphRef.current.d3ReheatSimulation();
+      }
+    }, 10000);
+
+    return () => clearInterval(breatheInterval);
+  }, [nodes]);
+
   useEffect(() => {
     fetchGraphData();
     startBotLoop();
