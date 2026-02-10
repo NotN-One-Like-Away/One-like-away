@@ -104,7 +104,7 @@ const normalize = (t: string): string => {
  */
 function getDominantCluster(
   profile: Map<string, number> | undefined,
-  dominanceRatio = 2.5
+  dominanceRatio = 1.8 // Reduced from 2.5 for faster chamber lock-in
 ): string {
   if (!profile || profile.size === 0) return 'neutral';
 

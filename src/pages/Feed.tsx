@@ -81,15 +81,19 @@ export function Feed() {
     const scoredPosts = allPosts.map(post => ({
       post,
       affinity: calculateAffinity(post, topicMap),
-      isRecent: Date.now() - new Date(post.created_at).getTime() < 30000,
+      isRecent: Date.now() - new Date(post.created_at).getTime() < 5000, // Reduced from 30s to 5s
     }));
 
     // Filter: as echo grows, threshold for inclusion rises
     const affinityThreshold = 0.1 + (echoStrength * 0.5);
 
     const filtered = scoredPosts.filter(({ affinity, isRecent }) => {
-      if (isRecent) return true;
-      // Deterministic filtering based purely on affinity and echo strength
+      // NO recent post bypass once user has preferences - outcomes based EXCLUSIVELY on likes
+      if (likedTopics.size === 0) {
+        // No preferences yet - show everything
+        return true;
+      }
+      // Strict filtering: affinity must meet threshold regardless of recency
       return affinity >= affinityThreshold;
     });
 

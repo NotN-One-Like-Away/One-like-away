@@ -550,7 +550,7 @@ async function spawnDrifters(): Promise<void> {
   }
 
   const maxToSpawn = MAX_DRIFTERS - liveCount;
-  const count = Math.min(3 + Math.floor(Math.random() * 3), maxToSpawn); // Demo: spawn 3-5 at once
+  const count = Math.min(3, maxToSpawn); // Fixed count of 3 for deterministic behavior
 
   for (let i = 0; i < count; i++) {
     const name = DRIFTER_NAMES[Math.floor(Math.random() * DRIFTER_NAMES.length)] +
@@ -573,10 +573,10 @@ async function spawnDrifters(): Promise<void> {
       activeDrifters.add(data.id);
 
       // Seed drifter with initial attraction toward one cluster
-      // This is the SAME mechanism as everyone else, just initialized
+      // Light initial preference - let their likes build the real identity
       const seedCluster = DRIFTER_SEED_CLUSTERS[Math.floor(Math.random() * DRIFTER_SEED_CLUSTERS.length)];
       await Promise.all(seedCluster.map(tag => 
-        updateAttraction(data.id, `topic:${tag}`, 12 + Math.floor(Math.random() * 7))
+        updateAttraction(data.id, `topic:${tag}`, 2.0) // Reduced from 12-19 to 2.0
       ));
 
       // Immediately like 2-4 posts matching their seed cluster
@@ -629,59 +629,22 @@ async function runDrifterLike(drifterId: string): Promise<void> {
 
   if (recommended.length === 0) return;
 
-  // ── Record exposure: mere viewing updates attraction ──
-  const feedSlice = recommended.slice(0, 10);
-  const exposureUpdates: Promise<void>[] = [];
-  for (const post of feedSlice) {
-    if (post.topic_tags) {
-      post.topic_tags.forEach(tag => {
-        const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
-        // Reduced exposure: passive viewing should not dominate intent
-        exposureUpdates.push(updateAttraction(drifterId, `topic:${canonical}`, 0.02));
-      });
-    }
-  }
-  await Promise.all(exposureUpdates);
-
-  // ── Pick a post to like (ε-greedy: exploit strongest pull 70% of time) ──
-  // This makes echo chamber "lock-in" visibly deterministic
-  let chosen: typeof recommended[0];
-  
-  if (Math.random() < 0.7) {
-    // Exploit: pick strongest affinity (echo chamber reinforcement)
-    chosen = recommended[0]; // Already sorted by affinity in getRecommendedPosts
-  } else {
-    // Explore: weighted random (allows discovery)
-    const totalAffinity = recommended.reduce((sum, p) => sum + p.affinity, 0);
-    let rand = Math.random() * totalAffinity;
-    chosen = recommended[0];
-
-    for (const post of recommended) {
-      rand -= post.affinity;
-      if (rand <= 0) {
-        chosen = post;
-        break;
-      }
-    }
-  }
+  // ── Pick a post to like (DETERMINISTIC: always pick highest affinity) ──
+  // No exposure tracking, no randomness - outcomes based EXCLUSIVELY on likes
+  const chosen = recommended[0]; // Already sorted by affinity in getRecommendedPosts
 
   const { error } = await supabase
     .from('likes')
     .upsert({ user_id: drifterId, post_id: chosen.id });
 
   if (!error) {
-    // ── Step 3: Likes = strong attraction ──
+    // ── Step 3: Likes = ONLY signal (no exposure, no social gravity) ──
     const likeUpdates: Promise<void>[] = [];
     for (const tag of chosen.topic_tags || []) {
       const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
       likeUpdates.push(updateAttraction(drifterId, `topic:${canonical}`, 1.0));
     }
-
-    // User-to-user attraction (sub-clusters)
-    const postAuthor = recentPosts.find(p => p.id === chosen.id)?.user_id;
-    if (postAuthor) {
-      likeUpdates.push(updateAttraction(drifterId, postAuthor, 0.3)); // Social gravity
-    }
+    // NO user-to-user attraction - outcomes based EXCLUSIVELY on topic likes
     await Promise.all(likeUpdates);
 
     const attraction = getAgentTopicProfile(drifterId);
@@ -696,6 +659,51 @@ async function runDrifterLike(drifterId: string): Promise<void> {
       `attraction: ${topTopics.join(', ')})`
     );
   }
+}
+
+/**
+ * Select a bot DETERMINISTICALLY based on aggregate user interests.
+ * No randomness - always pick the bot whose topics most align with user likes.
+ */
+function selectWeightedBot(bots: { id: string; display_name: string }[]): { id: string; display_name: string } {
+  // Calculate aggregate topic interests from all active users
+  const aggregateInterests = new Map<string, number>();
+  
+  for (const [userId, userAttractions] of attractionGraph) {
+    // Skip bots themselves and demo users
+    if (isDemoUser(userId)) continue;
+    
+    for (const [targetId, weight] of userAttractions) {
+      if (targetId.startsWith('topic:')) {
+        const topic = targetId.slice(6);
+        aggregateInterests.set(topic, (aggregateInterests.get(topic) || 0) + weight);
+      }
+    }
+  }
+
+  // If no user interests yet, cycle through bots round-robin
+  if (aggregateInterests.size === 0) {
+    // Use timestamp to get deterministic but varied selection
+    return bots[Date.now() % bots.length];
+  }
+
+  // Calculate bot weights based on topic alignment
+  const botWeights = bots.map(bot => {
+    const persona = BOT_PERSONAS[bot.display_name];
+    if (!persona) return { bot, weight: 0 };
+
+    // Bot weight = sum of user interest in bot's topics
+    let weight = 0;
+    for (const topic of persona.topics) {
+      weight += aggregateInterests.get(topic) || 0;
+    }
+
+    return { bot, weight };
+  });
+
+  // DETERMINISTIC selection: always pick bot with highest weight
+  botWeights.sort((a, b) => b.weight - a.weight);
+  return botWeights[0].bot;
 }
 
 // ── Opinionated bot run (post + like) ──────────────────────────────────────
@@ -713,7 +721,8 @@ export async function runBot(): Promise<boolean> {
       return false;
     }
 
-    const bot = bots[Math.floor(Math.random() * bots.length)];
+    // Weight bot selection by aggregate user interests (make bots responsive to the community)
+    const bot = selectWeightedBot(bots);
     const persona = BOT_PERSONAS[bot.display_name];
 
     if (!persona) {
@@ -727,9 +736,9 @@ export async function runBot(): Promise<boolean> {
     const needsSeeding = !botProfile || persona.hashtags.some(tag => !botProfile.has(`topic:${tag}`));
     
     if (needsSeeding) {
-      // High initial values = ideological gravity wells
+      // Moderate initial values - let likes build the identity organically
       await Promise.all(persona.hashtags.map(tag => 
-        updateAttraction(bot.id, `topic:${tag}`, 8.0) // Strong initial identity
+        updateAttraction(bot.id, `topic:${tag}`, 5.0)
       ));
     }
 
@@ -756,10 +765,10 @@ export async function runBot(): Promise<boolean> {
       return false;
     }
 
-    // ── Step 5: Opinionated bots as gravity wells ──
-    // Posts reinforce ideology more gently (likes do the heavy lifting)
+    // ── Step 5: Opinionated bots reinforce through posts ──
+    // Moderate reinforcement - primary signal comes from likes
     await Promise.all(topicTags.map(tag => 
-      updateAttraction(bot.id, `topic:${tag}`, 1.5)
+      updateAttraction(bot.id, `topic:${tag}`, 1.0)
     ));
 
     console.log(`Bot ${bot.display_name} posted: ${content.slice(0, 50)}...`);
@@ -785,9 +794,8 @@ export async function runBot(): Promise<boolean> {
         .filter(p => p.affinity > 0.3); // Demo: less picky (was 0.6), more echo chambering
 
       if (recommended.length > 0) {
-        // Strongly prefer the highest-affinity posts
-        const top3 = recommended.slice(0, 3);
-        const chosen = top3[Math.floor(Math.random() * top3.length)];
+        // DETERMINISTIC: always pick the highest-affinity post
+        const chosen = recommended[0];
 
         const { error: likeError } = await supabase
           .from('likes')
@@ -847,9 +855,9 @@ export function startBotLoop() {
 
   if (botInterval) return;
 
-  // Opinionated bot posting loop (8-15s - demo: very active)
+  // Opinionated bot posting loop (fixed 10s interval for deterministic behavior)
   const scheduleNext = () => {
-    const delay = 8000 + Math.random() * 7000;
+    const delay = 10000; // Fixed interval
     botInterval = window.setTimeout(async () => {
       await runBot();
       scheduleNext();
@@ -873,23 +881,23 @@ export function startBotLoop() {
     const drifterIds = Array.from(activeDrifters);
     if (drifterIds.length === 0) return;
 
-    // Each drifter has 90% chance to engage (demo: highly active)
-    for (const drifterId of drifterIds) {
-      if (Math.random() < 0.9) {
-        await runDrifterLike(drifterId);
-        // Decay drifter attractions slightly after each action to prevent unbounded growth
-        decayAttraction(drifterId, 0.99);
-      }
+    // Deterministic engagement: cycle through drifters
+    const cycleIndex = Math.floor(Date.now() / 1500) % Math.max(drifterIds.length, 1);
+    const drifterId = drifterIds[cycleIndex];
+    if (drifterId) {
+      await runDrifterLike(drifterId);
+      // Decay drifter attractions slightly after each action to prevent unbounded growth
+      decayAttraction(drifterId, 0.99);
     }
   }, 1500);
 
   // Global decay for all agents every 30s to prevent attraction explosion
-  // Bots decay very lightly (0.995), drifters more (0.98), humans moderately (0.99)
+  // Lighter decay to preserve like-based preferences longer
   decayInterval = window.setInterval(() => {
     for (const [agentId] of attractionGraph) {
-      // Check if it's a bot (UUID format check would be more robust)
       const isDrifter = activeDrifters.has(agentId);
-      const decayFactor = isDrifter ? 0.98 : 0.99;
+      // Drifters decay normally, others decay very lightly to preserve like history
+      const decayFactor = isDrifter ? 0.98 : 0.995;
       decayAttraction(agentId, decayFactor);
     }
   }, 30000);
