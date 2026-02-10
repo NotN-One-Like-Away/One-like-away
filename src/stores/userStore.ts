@@ -33,6 +33,12 @@ const isSupabaseConfigured = () => {
   return url && !url.includes('placeholder');
 };
 
+// Check if a user ID is a valid UUID (not a demo ID)
+const isValidUUID = (id: string) => {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(id);
+};
+
 export const useUserStore = create<UserStore>()(
   persist(
     (set, get) => ({
@@ -123,6 +129,13 @@ export const useUserStore = create<UserStore>()(
     {
       name: 'echo-chamber-user',
       partialize: (state) => ({ user: state.user }),
+      onRehydrateStorage: () => (state) => {
+        // Clear demo sessions when Supabase is configured
+        if (state?.user && isSupabaseConfigured() && !isValidUUID(state.user.id)) {
+          console.log('Clearing invalid demo session');
+          state.clearSession();
+        }
+      },
     }
   )
 );
