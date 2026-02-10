@@ -144,6 +144,19 @@ const DRIFTER_LIFESPAN_MS = 3 * 60 * 1000; // 3 minutes
 const DRIFTER_SPAWN_INTERVAL_MS = 90 * 1000; // 1.5 minutes
 const MAX_DRIFTERS = 6;
 
+// Topic clusters that drifters can be seeded into
+// Each drifter gets a random seed that pulls them toward one echo chamber
+const DRIFTER_SEED_CLUSTERS = [
+  ['fitness', 'workout', 'gains', 'gym', 'motivation'],
+  ['tech', 'ai', 'coding', 'programming', 'innovation'],
+  ['crypto', 'bitcoin', 'blockchain', 'defi', 'hodl'],
+  ['politics', 'progressive', 'conservative', 'justice', 'values'],
+  ['climate', 'environment', 'sustainability', 'green'],
+  ['gaming', 'esports', 'games', 'streaming'],
+  ['food', 'cooking', 'recipe', 'foodie'],
+  ['wellness', 'meditation', 'mindfulness', 'peace'],
+];
+
 /**
  * Build a topic affinity profile for a bot.
  * Opinionated bots: heavy seed weights so they almost never stray.
@@ -163,6 +176,17 @@ async function getBotTopicProfile(
     });
   }
 
+  // Layer on exposure memory (drifters only) — repeated viewing builds preference
+  if (!isOpinionated) {
+    const exposure = drifterExposure.get(botId);
+    if (exposure) {
+      exposure.forEach((impressions, tag) => {
+        // Each impression is worth 1 weight — accumulates fast
+        topicCounts.set(tag, (topicCounts.get(tag) || 0) + impressions);
+      });
+    }
+  }
+
   // Layer on learned preferences from past likes
   const { data: likes } = await supabase
     .from('likes')
@@ -174,7 +198,7 @@ async function getBotTopicProfile(
       const post = like.posts as unknown as { topic_tags: string[] } | null;
       if (post?.topic_tags) {
         post.topic_tags.forEach(tag => {
-          // Drifter bots learn faster from likes (weight 3), opinionated get normal (weight 1)
+          // Likes are worth more than impressions — active engagement reinforces
           const w = isOpinionated ? 1 : 3;
           topicCounts.set(tag, (topicCounts.get(tag) || 0) + w);
         });
@@ -186,9 +210,10 @@ async function getBotTopicProfile(
 }
 
 /**
- * Same affinity/recommendation algorithm as the user Feed.
+ * Same aggressive affinity/recommendation algorithm as the user Feed.
  * Scores posts by how well their tags match the bot's topic profile,
  * then sorts so the bot sees (and likes) echo-chamber-aligned content.
+ * This pulls drifters into echo chambers FAST.
  */
 function getRecommendedPosts(
   posts: { id: string; topic_tags: string[]; user_id: string }[],
@@ -199,32 +224,44 @@ function getRecommendedPosts(
   const candidates = posts.filter(p => p.user_id !== botId);
 
   if (topicProfile.size === 0) {
+    // No preferences yet - return all with equal affinity
     return candidates.map(p => ({ ...p, affinity: 1 }));
   }
 
   const maxWeight = Math.max(...topicProfile.values(), 1);
+  const totalExposure = Array.from(topicProfile.values()).reduce((a, b) => a + b, 0);
+  // Echo kicks in aggressively after just 5 total exposure points
+  const echoStrength = Math.min(totalExposure / 5, 1);
 
   const scored = candidates.map(post => {
     const tags = post.topic_tags || [];
     let score = 0;
+    let hasMatchingTag = false;
 
     for (const tag of tags) {
-      score += topicProfile.get(tag) || 0;
+      const weight = topicProfile.get(tag) || 0;
+      if (weight > 0) hasMatchingTag = true;
+      score += weight;
     }
 
     // Normalize
     const maxPossible = maxWeight * Math.max(tags.length, 1);
     const normalized = maxPossible > 0 ? score / maxPossible : 0;
 
-    // Echo chamber effect: stronger profile = more filtering
-    const echoStrength = Math.min(topicProfile.size / 8, 1);
-    const baseVisibility = 1 - echoStrength * 0.7;
-    const affinity = Math.max(baseVisibility, normalized + 0.3);
+    // Non-matching content gets heavily suppressed
+    if (!hasMatchingTag) {
+      const baseVisibility = Math.max(0.1, 0.5 * (1 - echoStrength));
+      return { id: post.id, topic_tags: post.topic_tags, affinity: baseVisibility };
+    }
+
+    // Matching content gets boosted
+    const boost = 0.6 + (normalized * 0.4);
+    const affinity = Math.min(1, boost + (echoStrength * 0.15));
 
     return { id: post.id, topic_tags: post.topic_tags, affinity };
   });
 
-  // Sort by affinity descending
+  // Sort by affinity descending - matching content floats to top
   scored.sort((a, b) => b.affinity - a.affinity);
 
   return scored;
@@ -233,27 +270,27 @@ function getRecommendedPosts(
 // ── Drifter bot management ─────────────────────────────────────────────────
 const activeDrifters = new Set<string>(); // track drifter IDs for liking loop
 
+// In-memory exposure memory: tracks which topics a drifter has been *shown*
+// by the recommendation algorithm. This simulates the real echo-chamber
+// mechanism — you don't need to like something for it to shape your worldview;
+// mere repeated exposure builds familiarity and preference.
+const drifterExposure = new Map<string, Map<string, number>>();
+
 async function spawnDrifters(): Promise<void> {
+  const now = new Date().toISOString();
+
   // Query the DB for currently alive drifters to get the real count
   const { data: liveDrifters } = await supabase
     .from('users')
     .select('id')
     .eq('is_bot', true)
-    .gt('expires_at', new Date().toISOString());
+    .gt('expires_at', now);
 
   const liveCount = liveDrifters?.length ?? 0;
 
   // Sync activeDrifters set with DB reality
   activeDrifters.clear();
   liveDrifters?.forEach(d => activeDrifters.add(d.id));
-
-  // Delete expired drifters from the database
-  await supabase
-    .from('users')
-    .delete()
-    .eq('is_bot', true)
-    .not('expires_at', 'is', null)
-    .lt('expires_at', new Date().toISOString());
 
   if (liveCount >= MAX_DRIFTERS) {
     console.log(`Drifter cap reached (${liveCount}/${MAX_DRIFTERS}), skipping spawn`);
@@ -282,23 +319,28 @@ async function spawnDrifters(): Promise<void> {
 
     if (!error && data) {
       activeDrifters.add(data.id);
-      console.log(`Drifter "${name}" spawned (expires in 3 min)`);
 
-      // Delete from DB when lifespan ends (cascade removes likes/posts,
-      // triggers realtime event so graph refetches immediately)
-      setTimeout(async () => {
-        activeDrifters.delete(data.id);
-        await supabase.from('users').delete().eq('id', data.id);
-        console.log(`Drifter "${name}" expired and deleted`);
-      }, DRIFTER_LIFESPAN_MS);
+      // Give this drifter a random seed preference toward one echo chamber
+      // This simulates them having seen some content before joining
+      const seedCluster = DRIFTER_SEED_CLUSTERS[Math.floor(Math.random() * DRIFTER_SEED_CLUSTERS.length)];
+      const seedExposure = new Map<string, number>();
+      seedCluster.forEach(tag => {
+        // Strong initial seed (8-12 points) so they drift toward this cluster
+        seedExposure.set(tag, 8 + Math.floor(Math.random() * 5));
+      });
+      drifterExposure.set(data.id, seedExposure);
+
+      console.log(`Drifter "${name}" spawned, seeded toward: ${seedCluster[0]}`);
     }
   }
 }
 
 /**
- * Make a drifter bot like a post. Drifters have no opinions —
- * they just like whatever the recommendation algo serves them,
- * which pulls them into echo chambers organically.
+ * Make a drifter bot like a post. Drifters start with no opinions —
+ * they build preferences from what the algorithm shows them (exposure)
+ * and what they choose to like (engagement). This two-layer feedback
+ * loop pulls them into echo chambers organically:
+ *   see topic → familiarity grows → algo shows more → like it → preference locks in
  */
 async function runDrifterLike(drifterId: string): Promise<void> {
   const topicProfile = await getBotTopicProfile(drifterId, null, false);
@@ -324,7 +366,20 @@ async function runDrifterLike(drifterId: string): Promise<void> {
 
   if (recommended.length === 0) return;
 
-  // Drifters are less picky — weighted random but with flatter distribution
+  // ── Record exposure: the top posts the algo "showed" this drifter ──
+  // Even without liking, seeing the same topics repeatedly builds familiarity
+  const exposure = drifterExposure.get(drifterId) || new Map<string, number>();
+  const feedSlice = recommended.slice(0, 10); // top 10 = their "feed"
+  for (const post of feedSlice) {
+    if (post.topic_tags) {
+      for (const tag of post.topic_tags) {
+        exposure.set(tag, (exposure.get(tag) || 0) + 1);
+      }
+    }
+  }
+  drifterExposure.set(drifterId, exposure);
+
+  // ── Pick a post to like (weighted random by affinity) ──
   const totalAffinity = recommended.reduce((sum, p) => sum + p.affinity, 0);
   let rand = Math.random() * totalAffinity;
   let chosen = recommended[0];
@@ -342,8 +397,14 @@ async function runDrifterLike(drifterId: string): Promise<void> {
     .upsert({ user_id: drifterId, post_id: chosen.id });
 
   if (!error) {
+    const topTags = Array.from(exposure.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([t, c]) => `${t}(${c})`);
     console.log(
-      `Drifter liked post (affinity: ${chosen.affinity.toFixed(2)}, tags: ${chosen.topic_tags?.join(', ')})`
+      `Drifter liked post (affinity: ${chosen.affinity.toFixed(2)}, ` +
+      `tags: ${chosen.topic_tags?.join(', ')}, ` +
+      `top exposure: ${topTags.join(', ')})`
     );
   }
 }
@@ -442,10 +503,33 @@ export async function runBot(): Promise<boolean> {
   }
 }
 
+// ── Cleanup expired drifters from the database ────────────────────────────
+async function cleanupExpiredDrifters(): Promise<void> {
+  const now = new Date().toISOString();
+
+  // Delete all expired drifters from DB (cascade removes likes/posts)
+  const { data: deleted, error } = await supabase
+    .from('users')
+    .delete()
+    .eq('is_bot', true)
+    .not('expires_at', 'is', null)
+    .lt('expires_at', now)
+    .select('id, display_name');
+
+  if (!error && deleted && deleted.length > 0) {
+    deleted.forEach(d => {
+      activeDrifters.delete(d.id);
+      drifterExposure.delete(d.id);
+      console.log(`Cleaned up expired drifter: ${d.display_name}`);
+    });
+  }
+}
+
 // ── Main loops ─────────────────────────────────────────────────────────────
 let botInterval: number | null = null;
 let drifterSpawnInterval: number | null = null;
 let drifterLikeInterval: number | null = null;
+let cleanupInterval: number | null = null;
 
 export function startBotLoop() {
   if (botInterval) return;
@@ -462,18 +546,28 @@ export function startBotLoop() {
   runBot().then(scheduleNext);
   console.log('Bot loop started');
 
+  // Cleanup expired drifters immediately and every 10 seconds
+  cleanupExpiredDrifters();
+  cleanupInterval = window.setInterval(cleanupExpiredDrifters, 10000);
+
   // Spawn a batch of drifters immediately, then every 1.5 minutes
   spawnDrifters();
   drifterSpawnInterval = window.setInterval(spawnDrifters, DRIFTER_SPAWN_INTERVAL_MS);
 
-  // Drifter like loop — every 5s pick a random drifter and have it like something
+  // Drifter like loop — every 3s have ALL drifters consider liking something
+  // This builds up their database likes quickly so the graph can detect clusters
   drifterLikeInterval = window.setInterval(async () => {
     const drifterIds = Array.from(activeDrifters);
     if (drifterIds.length === 0) return;
-    // Pick a random drifter to like something
-    const drifterId = drifterIds[Math.floor(Math.random() * drifterIds.length)];
-    await runDrifterLike(drifterId);
-  }, 5000);
+
+    // Each drifter has a chance to like something each tick
+    for (const drifterId of drifterIds) {
+      // 70% chance to engage each tick - simulates browsing behavior
+      if (Math.random() < 0.7) {
+        await runDrifterLike(drifterId);
+      }
+    }
+  }, 3000);
 }
 
 export function stopBotLoop() {
@@ -489,6 +583,11 @@ export function stopBotLoop() {
     clearInterval(drifterLikeInterval);
     drifterLikeInterval = null;
   }
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = null;
+  }
   activeDrifters.clear();
+  drifterExposure.clear();
   console.log('Bot loop stopped');
 }

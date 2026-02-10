@@ -13,6 +13,7 @@ interface GraphNode {
   topics: string[];
   cluster?: string;
   clusterColor?: string;
+  clusterJoinTime?: number; // Timestamp when node joined its current cluster
   x?: number;
   y?: number;
   vx?: number;
@@ -169,6 +170,8 @@ export function Graph() {
     // Build user topic profiles
     const userTopics = new Map<string, Map<string, number>>();
 
+    console.log(`[Graph Data] Processing ${likes?.length || 0} likes`);
+
     likes?.forEach((like) => {
       const post = like.posts as unknown as { user_id: string; topic_tags: string[] } | null;
       if (!post?.topic_tags) return;
@@ -179,6 +182,8 @@ export function Graph() {
       });
       userTopics.set(like.user_id, existing);
     });
+
+    console.log(`[Graph Data] Users with topic profiles: ${userTopics.size}`);
 
     // Find dominant cluster for each user (normalize topics to clusters first)
     const userDominantTopic = new Map<string, string>();
@@ -206,12 +211,17 @@ export function Graph() {
     // Build nodes - preserve existing positions from the ref (not stale state)
     const currentNodes = nodesRef.current;
     const currentNodeMap = new Map(currentNodes.map(n => [n.id, n]));
+    const now = Date.now();
 
     const graphNodes: GraphNode[] = users.map((user) => {
       const topics = userTopics.get(user.id);
       const topicList = topics ? Array.from(topics.keys()) : [];
       const dominantTopic = userDominantTopic.get(user.id);
       const existing = currentNodeMap.get(user.id);
+
+      // Track when cluster changes for visual effect
+      const clusterChanged = existing?.cluster !== dominantTopic;
+      const clusterJoinTime = clusterChanged ? now : (existing?.clusterJoinTime || now);
 
       return {
         id: user.id,
@@ -221,6 +231,7 @@ export function Graph() {
         topics: topicList,
         cluster: dominantTopic,
         clusterColor: dominantTopic ? getClusterColor(dominantTopic) : undefined,
+        clusterJoinTime,
         // Preserve simulation state from ref so positions are never lost
         ...(existing ? { x: existing.x, y: existing.y, vx: existing.vx, vy: existing.vy } : {}),
       };
@@ -282,18 +293,29 @@ export function Graph() {
     setNodes(graphNodes);
     setLinks(graphLinks);
 
-    // Reheat simulation when any node's cluster assignment changed
-    // so the pull toward echo chambers is dramatic and visible
-    let clusterChanged = false;
+    // Debug: log cluster assignments
+    const nodesWithClusters = graphNodes.filter(n => n.cluster);
+    const clusterCounts = new Map<string, number>();
+    nodesWithClusters.forEach(n => {
+      clusterCounts.set(n.cluster!, (clusterCounts.get(n.cluster!) || 0) + 1);
+    });
+    console.log(`[Graph Data] Total nodes: ${graphNodes.length}, with clusters: ${nodesWithClusters.length}`);
+    console.log(`[Graph Data] Cluster breakdown:`, Object.fromEntries(clusterCounts));
+
+    // Track cluster changes for logging
     const newClusterMap = new Map<string, string>();
     graphNodes.forEach(n => {
       if (n.cluster) newClusterMap.set(n.id, n.cluster);
       const prev = prevClusterMap.current.get(n.id);
-      if (n.cluster && n.cluster !== prev) clusterChanged = true;
+      if (n.cluster && n.cluster !== prev) {
+        console.log(`Node ${n.name} joined cluster: ${n.cluster}`);
+      }
     });
     prevClusterMap.current = newClusterMap;
 
-    if (clusterChanged && graphRef.current) {
+    // ALWAYS reheat on data update - keeps the simulation alive and moving
+    // This makes echo chamber formation visually dramatic
+    if (graphRef.current) {
       graphRef.current.d3ReheatSimulation();
     }
   }, []);
@@ -366,19 +388,19 @@ export function Graph() {
     const fg = graphRef.current;
     forcesConfigured.current = true;
 
-    // Reduce repulsion to let nodes cluster together, with distance cap
+    // Weak repulsion so clusters can form tightly
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const charge = fg.d3Force('charge') as any;
     if (charge?.strength) {
-      charge.strength(-60);
-      charge.distanceMax(100);
-      charge.distanceMin(5);
+      charge.strength(-30); // Weaker repulsion = tighter clusters
+      charge.distanceMax(150);
+      charge.distanceMin(10);
     }
 
-    // Tighter link distance for clustering
+    // Link distance - allows some spread within clusters
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const link = fg.d3Force('link') as any;
-    if (link?.distance) link.distance(40);
+    if (link?.distance) link.distance(50);
 
     // Stronger center force to keep graph stable
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -420,9 +442,10 @@ export function Graph() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     fg.d3Force('collide', collideForceFn() as any);
 
-    // Custom clustering force: pull same-cluster nodes toward each other
+    // Custom clustering force: pull same-cluster nodes toward each other STRONGLY
     const clusterForceFn = () => {
       let forceNodes: GraphNode[] = [];
+      let lastLog = 0;
       const force = (alpha: number) => {
         const centroids = new Map<string, { x: number; y: number; count: number }>();
         forceNodes.forEach(node => {
@@ -434,18 +457,33 @@ export function Graph() {
           centroids.set(node.cluster, c);
         });
 
+        // Debug log every 2 seconds
+        const now = Date.now();
+        if (now - lastLog > 2000) {
+          lastLog = now;
+          const nodesWithCluster = forceNodes.filter(n => n.cluster).length;
+          console.log(`[Cluster Force] alpha=${alpha.toFixed(3)}, nodes with cluster: ${nodesWithCluster}/${forceNodes.length}, clusters: ${Array.from(centroids.keys()).join(', ')}`);
+        }
+
         forceNodes.forEach(node => {
           if (!node.cluster) return;
           const c = centroids.get(node.cluster);
           if (!c || c.count < 2) return;
           const cx = c.x / c.count;
           const cy = c.y / c.count;
-          // Use a minimum alpha so cluster force stays gently active
-          // even after the simulation cools down — lets late-arriving
-          // drifters drift toward their echo chamber continuously.
-          const effectiveAlpha = Math.max(alpha, 0.01);
-          node.vx! += (cx - node.x!) * effectiveAlpha * 0.4;
-          node.vy! += (cy - node.y!) * effectiveAlpha * 0.4;
+
+          // Distance to cluster center
+          const dx = cx - node.x!;
+          const dy = cy - node.y!;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          // STRONG pull toward cluster - minimum alpha of 0.1 keeps it always active
+          // Strength increases with distance (nodes far from cluster get pulled harder)
+          const effectiveAlpha = Math.max(alpha, 0.1);
+          const pullStrength = effectiveAlpha * 0.8 * Math.min(dist / 100, 1.5);
+
+          node.vx! += dx * pullStrength;
+          node.vy! += dy * pullStrength;
         });
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -462,17 +500,17 @@ export function Graph() {
     fetchGraphData();
     startBotLoop();
 
-    // Debounce real-time updates to avoid constant re-fetching
-    const debouncedFetch = () => {
+    // Debounce real-time updates - faster for user changes (deletions), slower for likes
+    const debouncedFetch = (fast = false) => {
       if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
-      fetchTimeout.current = window.setTimeout(fetchGraphData, 1000);
+      fetchTimeout.current = window.setTimeout(fetchGraphData, fast ? 300 : 800);
     };
 
     const channel = supabase
       .channel('graph-updates')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, debouncedFetch)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, debouncedFetch)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, debouncedFetch)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, () => debouncedFetch(true)) // Fast update for user changes (drifter expiration)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, () => debouncedFetch(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => debouncedFetch(false))
       .subscribe();
 
     const handleResize = () => {
@@ -552,6 +590,19 @@ export function Graph() {
     const size = node.is_bot ? 10 : 14;
     const outlineColor = node.clusterColor || getOutlineColor(node.id, node.is_bot);
 
+    // Pulsing glow effect for nodes that recently joined a cluster (within 5 seconds)
+    const timeSinceJoin = node.clusterJoinTime ? (Date.now() - node.clusterJoinTime) : Infinity;
+    if (node.cluster && timeSinceJoin < 5000) {
+      const pulsePhase = (timeSinceJoin / 300) % (2 * Math.PI);
+      const pulseSize = size + 8 + Math.sin(pulsePhase) * 4;
+      const pulseOpacity = Math.max(0, 1 - timeSinceJoin / 5000);
+
+      ctx.beginPath();
+      ctx.arc(node.x!, node.y!, pulseSize, 0, 2 * Math.PI);
+      ctx.fillStyle = `${outlineColor}${Math.floor(pulseOpacity * 100).toString(16).padStart(2, '0')}`;
+      ctx.fill();
+    }
+
     // Outline
     ctx.beginPath();
     ctx.arc(node.x!, node.y!, size + 3, 0, 2 * Math.PI);
@@ -606,8 +657,8 @@ export function Graph() {
           return l.isTopicLink ? 'rgba(99, 102, 241, 0.15)' : 'rgba(99, 102, 241, 0.4)';
         }}
         linkWidth={(link) => Math.min((link as GraphLink).strength * 0.5, 4)}
-        d3AlphaDecay={0.05}
-        d3VelocityDecay={0.4}
+        d3AlphaDecay={0.02}
+        d3VelocityDecay={0.3}
         cooldownTime={Infinity}
       />
 

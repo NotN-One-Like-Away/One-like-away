@@ -12,64 +12,83 @@ export function Feed() {
   const [isLoading, setIsLoading] = useState(true);
   const [showCompose, setShowCompose] = useState(false);
   const [likedTopics, setLikedTopics] = useState<Map<string, number>>(new Map());
-  const { user, isExpired } = useUserStore();
+  const { user, isExpired, clearSession } = useUserStore();
   const likedPostIdsRef = useRef<Set<string>>(new Set());
 
   // Calculate affinity score for a post based on liked topics
+  // This is the core echo chamber mechanism - users get trapped fast
   const calculateAffinity = useCallback((post: PostType): number => {
     if (likedTopics.size === 0) return 1; // No preferences yet, show everything
 
     let score = 0;
     const tags = post.topic_tags || [];
 
+    // Check if ANY tag matches user's interests
+    let hasMatchingTag = false;
     for (const tag of tags) {
       const topicWeight = likedTopics.get(tag) || 0;
+      if (topicWeight > 0) hasMatchingTag = true;
       score += topicWeight;
     }
 
-    // Normalize: posts with liked topics get boosted, others get slightly reduced
-    // But always keep some diversity (minimum 0.2 chance)
-    const maxPossibleScore = Math.max(...likedTopics.values(), 1) * tags.length;
+    // Normalize score
+    const maxPossibleScore = Math.max(...likedTopics.values(), 1) * Math.max(tags.length, 1);
     const normalizedScore = maxPossibleScore > 0 ? score / maxPossibleScore : 0;
 
-    // Echo chamber effect: as you like more, non-matching content fades
-    const echoStrength = Math.min(likedTopics.size / 5, 1); // Max effect after 5 liked topics
-    const baseVisibility = 1 - (echoStrength * 0.7); // Drops to 0.3 minimum
+    // AGGRESSIVE echo chamber effect - kicks in after just 2 likes
+    const totalLikes = Array.from(likedTopics.values()).reduce((a, b) => a + b, 0);
+    const echoStrength = Math.min(totalLikes / 3, 1); // Max effect after 3 total likes
 
-    return Math.max(baseVisibility, normalizedScore + 0.3);
+    // Non-matching content gets heavily suppressed
+    if (!hasMatchingTag) {
+      // Visibility drops rapidly: 100% -> 40% -> 15% -> 5% as echo grows
+      const baseVisibility = Math.max(0.05, 0.4 * (1 - echoStrength));
+      return baseVisibility;
+    }
+
+    // Matching content gets boosted
+    const boost = 0.5 + (normalizedScore * 0.5); // 0.5 to 1.0
+    return Math.min(1, boost + (echoStrength * 0.2)); // Extra boost as echo strengthens
   }, [likedTopics]);
 
   // Sort and filter posts based on affinity
+  // The more you like, the more aggressively we filter your feed
   const getRecommendedPosts = useCallback((allPosts: PostType[]): PostType[] => {
     if (likedTopics.size === 0) {
       // No likes yet - show chronologically
       return allPosts;
     }
 
+    const totalLikes = Array.from(likedTopics.values()).reduce((a, b) => a + b, 0);
+    const echoStrength = Math.min(totalLikes / 3, 1);
+
     // Score each post
     const scoredPosts = allPosts.map(post => ({
       post,
       affinity: calculateAffinity(post),
-      isRecent: Date.now() - new Date(post.created_at).getTime() < 60000, // Last minute
+      isRecent: Date.now() - new Date(post.created_at).getTime() < 30000, // Last 30 seconds
     }));
 
-    // Filter out low-affinity posts (but keep very recent ones)
+    // Filter: as echo grows, threshold for inclusion rises
+    // At max echo, only posts with >0.6 affinity make it through
+    const affinityThreshold = 0.1 + (echoStrength * 0.5);
+
     const filtered = scoredPosts.filter(({ affinity, isRecent }) => {
-      if (isRecent) return true; // Always show very recent posts
-      return Math.random() < affinity; // Probabilistic filtering based on affinity
+      // Very recent posts get a pass (but still sorted down if low affinity)
+      if (isRecent) return true;
+      // Hard cutoff based on echo strength
+      if (affinity < affinityThreshold) return false;
+      // Probabilistic for edge cases
+      return Math.random() < (affinity * 1.5);
     });
 
-    // Sort: high affinity first, then by recency
+    // Sort: affinity is king, recency is secondary
     filtered.sort((a, b) => {
-      // Recent posts always on top
-      if (a.isRecent && !b.isRecent) return -1;
-      if (!a.isRecent && b.isRecent) return 1;
-
-      // Then by affinity
+      // Strong affinity difference = sort by affinity
       const affinityDiff = b.affinity - a.affinity;
-      if (Math.abs(affinityDiff) > 0.2) return affinityDiff;
+      if (Math.abs(affinityDiff) > 0.15) return affinityDiff;
 
-      // Then by time
+      // Similar affinity = sort by time
       return new Date(b.post.created_at).getTime() - new Date(a.post.created_at).getTime();
     });
 
@@ -217,7 +236,10 @@ export function Feed() {
           Your time in the echo chamber has ended. Check out the big screen to see where you ended up!
         </p>
         <button
-          onClick={() => window.location.reload()}
+          onClick={() => {
+            clearSession();
+            window.location.href = '/';
+          }}
           className="px-6 py-3 bg-[var(--accent)] rounded-xl font-semibold hover:bg-[var(--accent-hover)] transition-colors"
         >
           Start New Session
