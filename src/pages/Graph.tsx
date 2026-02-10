@@ -126,6 +126,7 @@ export function Graph() {
   const fetchTimeout = useRef<number | null>(null);
   const lastClearTime = useRef(0);
   const drawnAuras = useRef(new Set<string>());
+  const prevClusterMap = useRef(new Map<string, string>());
 
   const getOutlineColor = useCallback((userId: string, isBot: boolean) => {
     if (isBot) return '#6366f1';
@@ -280,6 +281,21 @@ export function Graph() {
     nodesRef.current = graphNodes;
     setNodes(graphNodes);
     setLinks(graphLinks);
+
+    // Reheat simulation when any node's cluster assignment changed
+    // so the pull toward echo chambers is dramatic and visible
+    let clusterChanged = false;
+    const newClusterMap = new Map<string, string>();
+    graphNodes.forEach(n => {
+      if (n.cluster) newClusterMap.set(n.id, n.cluster);
+      const prev = prevClusterMap.current.get(n.id);
+      if (n.cluster && n.cluster !== prev) clusterChanged = true;
+    });
+    prevClusterMap.current = newClusterMap;
+
+    if (clusterChanged && graphRef.current) {
+      graphRef.current.d3ReheatSimulation();
+    }
   }, []);
 
   // Update cluster positions periodically (reads from nodesRef for latest sim positions)
@@ -369,6 +385,41 @@ export function Graph() {
     const center = fg.d3Force('center') as any;
     if (center?.strength) center.strength(1);
 
+    // Collision force: prevent nodes from overlapping
+    // Node radii are 13 (bot) / 17 (human) — add padding so they stay close but never overlap
+    const collideForceFn = () => {
+      let forceNodes: GraphNode[] = [];
+      const force = () => {
+        for (let i = 0; i < forceNodes.length; i++) {
+          for (let j = i + 1; j < forceNodes.length; j++) {
+            const a = forceNodes[i];
+            const b = forceNodes[j];
+            if (a.x === undefined || a.y === undefined || b.x === undefined || b.y === undefined) continue;
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const rA = (a.is_bot ? 13 : 17) + 4;
+            const rB = (b.is_bot ? 13 : 17) + 4;
+            const minDist = rA + rB;
+            if (dist < minDist) {
+              const overlap = (minDist - dist) / dist * 0.5;
+              const mx = dx * overlap;
+              const my = dy * overlap;
+              a.vx! -= mx;
+              a.vy! -= my;
+              b.vx! += mx;
+              b.vy! += my;
+            }
+          }
+        }
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (force as any).initialize = (n: GraphNode[]) => { forceNodes = n; };
+      return force;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fg.d3Force('collide', collideForceFn() as any);
+
     // Custom clustering force: pull same-cluster nodes toward each other
     const clusterForceFn = () => {
       let forceNodes: GraphNode[] = [];
@@ -389,8 +440,12 @@ export function Graph() {
           if (!c || c.count < 2) return;
           const cx = c.x / c.count;
           const cy = c.y / c.count;
-          node.vx! += (cx - node.x!) * alpha * 0.4;
-          node.vy! += (cy - node.y!) * alpha * 0.4;
+          // Use a minimum alpha so cluster force stays gently active
+          // even after the simulation cools down — lets late-arriving
+          // drifters drift toward their echo chamber continuously.
+          const effectiveAlpha = Math.max(alpha, 0.01);
+          node.vx! += (cx - node.x!) * effectiveAlpha * 0.4;
+          node.vy! += (cy - node.y!) * effectiveAlpha * 0.4;
         });
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

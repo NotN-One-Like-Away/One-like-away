@@ -284,10 +284,12 @@ async function spawnDrifters(): Promise<void> {
       activeDrifters.add(data.id);
       console.log(`Drifter "${name}" spawned (expires in 3 min)`);
 
-      // Schedule removal after lifespan
-      setTimeout(() => {
+      // Delete from DB when lifespan ends (cascade removes likes/posts,
+      // triggers realtime event so graph refetches immediately)
+      setTimeout(async () => {
         activeDrifters.delete(data.id);
-        console.log(`Drifter "${name}" expired`);
+        await supabase.from('users').delete().eq('id', data.id);
+        console.log(`Drifter "${name}" expired and deleted`);
       }, DRIFTER_LIFESPAN_MS);
     }
   }
