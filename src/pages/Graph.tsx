@@ -57,6 +57,10 @@ CLUSTER_NAMES.forEach((name, i) => {
 });
 
 const TOPIC_TO_CLUSTER: Record<string, string> = {
+  // canonical names map to themselves
+  fitness: 'fitness', tech: 'tech', crypto: 'crypto', politics: 'politics',
+  climate: 'climate', gaming: 'gaming', food: 'food', wellness: 'wellness',
+  conspiracy: 'conspiracy',
   // fitness
   workout: 'fitness', gym: 'fitness', gains: 'fitness', motivation: 'fitness',
   mealprep: 'fitness', health: 'fitness', protein: 'fitness',
@@ -205,6 +209,7 @@ export function Graph() {
   const graphRef = useRef<ForceGraphMethods>(null);
   const nodesRef = useRef<GraphNode[]>([]);
   const topicsRef = useRef<Map<string, Map<string, number>>>(new Map()); // userId → {cluster → weight}
+  const likeTopicsRef = useRef<Map<string, Map<string, number>>>(new Map()); // userId → likes-only {cluster → weight}
   const forcesConfigured = useRef(false);
   const drawnAuras = useRef<Set<string>>(new Set());
   const lastAuraClear = useRef(0);
@@ -273,6 +278,9 @@ export function Graph() {
     // Build topic profiles from BOTH posts (what they produce) AND likes (what they consume)
     // This ensures bots always have a profile even before they've liked anything
     const profiles = new Map<string, Map<string, number>>();
+    // Separate likes-only profile — this determines cluster assignment.
+    // Users get pulled to the echo chamber they LIKED the most, not what they posted about.
+    const likeProfiles = new Map<string, Map<string, number>>();
 
     // 1. Posts: what each user produces (critical for bots as cluster anchors)
     allPosts?.forEach(p => {
@@ -292,25 +300,31 @@ export function Graph() {
       if (!tags) return;
       if (!profiles.has(l.user_id)) profiles.set(l.user_id, new Map());
       const m = profiles.get(l.user_id)!;
+      // Also track in likes-only profile
+      if (!likeProfiles.has(l.user_id)) likeProfiles.set(l.user_id, new Map());
+      const lm = likeProfiles.get(l.user_id)!;
       tags.forEach(t => {
         const k = normalize(t);
         m.set(k, (m.get(k) || 0) + 1);
+        lm.set(k, (lm.get(k) || 0) + 1);
       });
     });
     topicsRef.current = profiles;
+    likeTopicsRef.current = likeProfiles;
 
     // Build nodes, preserving sim state
     const prevMap = new Map(nodesRef.current.map(n => [n.id, n]));
     const graphNodes: GraphNode[] = users.map(u => {
       const old = prevMap.get(u.id);
-      const profile = profiles.get(u.id);
 
-      // Determine dominant cluster — every user with ANY topic profile
-      // gets assigned to their highest-weight cluster (no staying neutral).
+      // For cluster assignment: use LIKES-ONLY profile so users get pulled
+      // to the echo chamber they liked the most posts about.
+      // Bots without likes fall back to their post profile (they're anchors).
+      const clusterProfile = likeProfiles.get(u.id) || (u.is_bot ? profiles.get(u.id) : undefined);
+
       let maxCluster = 'neutral', maxCount = 0;
-      if (profile && profile.size > 0) {
-        profile.forEach((count, cluster) => {
-          // Only accept canonical clusters (skip raw topic names that didn't normalize)
+      if (clusterProfile && clusterProfile.size > 0) {
+        clusterProfile.forEach((count, cluster) => {
           if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
             maxCount = count;
             maxCluster = cluster;
@@ -492,27 +506,40 @@ export function Graph() {
           .single();
 
         if (post?.topic_tags) {
-          // Incrementally update the live topic map
+          // Incrementally update the combined topic map
           if (!topicsRef.current.has(like.user_id)) {
             topicsRef.current.set(like.user_id, new Map());
           }
           const m = topicsRef.current.get(like.user_id)!;
+
+          // Also update the likes-only topic map (used for cluster assignment)
+          if (!likeTopicsRef.current.has(like.user_id)) {
+            likeTopicsRef.current.set(like.user_id, new Map());
+          }
+          const lm = likeTopicsRef.current.get(like.user_id)!;
+
           post.topic_tags.forEach((t: string) => {
             const k = normalize(t);
             m.set(k, (m.get(k) || 0) + 1);
+            lm.set(k, (lm.get(k) || 0) + 1);
           });
 
-          // Update node's cluster assignment live (canonical clusters only)
+          // Update node's cluster based on LIKES only (what they consumed)
           const node = nodesRef.current.find(n => n.id === like.user_id);
           if (node) {
             let maxCluster = 'neutral', maxCount = 0;
-            m.forEach((count, cluster) => {
+            lm.forEach((count, cluster) => {
               if (CANONICAL_CLUSTER_COLORS[cluster] && count > maxCount) {
                 maxCount = count; maxCluster = cluster;
               }
             });
             node.cluster = maxCluster;
             node.clusterColor = CANONICAL_CLUSTER_COLORS[maxCluster] || '#6b7280';
+            // Trigger React re-render so the graph picks up the new cluster
+            setNodes(prev => [...prev]);
+          } else {
+            // Node not found yet (race condition) — full refetch will pick it up
+            fetchGraphData();
           }
 
           graphRef.current?.d3ReheatSimulation();
