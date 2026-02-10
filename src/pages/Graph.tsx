@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase } from '../lib/supabase';
@@ -34,6 +34,7 @@ interface ClusterInfo {
   color: string;
   x: number;
   y: number;
+  radius: number;
   memberCount: number;
 }
 
@@ -68,6 +69,44 @@ const CLUSTER_COLORS: Record<string, string> = {
 
 const DEFAULT_CLUSTER_COLOR = '#6366f1';
 
+// Normalize related topics to a single canonical cluster name
+const TOPIC_TO_CLUSTER: Record<string, string> = {
+  fitness: 'fitness', workout: 'fitness', gains: 'fitness', gym: 'fitness',
+  motivation: 'fitness', mealprep: 'fitness', health: 'fitness',
+  tech: 'tech', ai: 'tech', coding: 'tech', programming: 'tech',
+  innovation: 'tech', automation: 'tech', developers: 'tech', devlife: 'tech',
+  crypto: 'crypto', bitcoin: 'crypto', blockchain: 'crypto', defi: 'crypto',
+  hodl: 'crypto', investing: 'crypto',
+  politics: 'politics', progressive: 'politics', conservative: 'politics',
+  justice: 'politics', equality: 'politics', healthcare: 'politics',
+  change: 'politics', reform: 'politics', workers: 'politics',
+  values: 'politics', freedom: 'politics', family: 'politics',
+  tradition: 'politics', liberty: 'politics',
+  climate: 'climate', environment: 'climate', sustainability: 'climate',
+  green: 'climate', action: 'climate', activism: 'climate',
+  gaming: 'gaming', esports: 'gaming', streaming: 'gaming',
+  games: 'gaming', streamer: 'gaming', pc: 'gaming',
+  food: 'food', cooking: 'food', recipe: 'food',
+  foodie: 'food', chef: 'food', italian: 'food', baking: 'food', recipes: 'food',
+  wellness: 'wellness', meditation: 'wellness', mindfulness: 'wellness',
+  peace: 'wellness', selfcare: 'wellness', zen: 'wellness',
+  conspiracy: 'conspiracy', truth: 'conspiracy', wakeup: 'conspiracy',
+  question: 'conspiracy', research: 'conspiracy', aware: 'conspiracy',
+};
+
+// Canonical cluster colors (one per cluster)
+const CANONICAL_CLUSTER_COLORS: Record<string, string> = {
+  fitness: '#22c55e',
+  tech: '#3b82f6',
+  crypto: '#f59e0b',
+  politics: '#ef4444',
+  climate: '#10b981',
+  gaming: '#8b5cf6',
+  food: '#f97316',
+  wellness: '#ec4899',
+  conspiracy: '#6b7280',
+};
+
 const OUTLINE_COLORS = [
   '#ef4444', '#f97316', '#eab308', '#22c55e',
   '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899'
@@ -81,6 +120,12 @@ export function Graph() {
   const graphRef = useRef<ForceGraphMethods>(null);
   const colorIndexRef = useRef<Map<string, number>>(new Map());
   const clusterUpdateInterval = useRef<number | null>(null);
+  const nodesRef = useRef<GraphNode[]>([]);
+  const clustersRef = useRef<ClusterInfo[]>([]);
+  const forcesConfigured = useRef(false);
+  const fetchTimeout = useRef<number | null>(null);
+  const lastClearTime = useRef(0);
+  const drawnAuras = useRef(new Set<string>());
 
   const getOutlineColor = useCallback((userId: string, isBot: boolean) => {
     if (isBot) return '#6366f1';
@@ -90,8 +135,12 @@ export function Graph() {
     return OUTLINE_COLORS[colorIndexRef.current.get(userId)!];
   }, []);
 
-  const getClusterColor = (topic: string): string => {
-    return CLUSTER_COLORS[topic.toLowerCase()] || DEFAULT_CLUSTER_COLOR;
+  const normalizeToCluster = (topic: string): string => {
+    return TOPIC_TO_CLUSTER[topic.toLowerCase()] || topic.toLowerCase();
+  };
+
+  const getClusterColor = (cluster: string): string => {
+    return CANONICAL_CLUSTER_COLORS[cluster] || CLUSTER_COLORS[cluster.toLowerCase()] || DEFAULT_CLUSTER_COLOR;
   };
 
   const fetchGraphData = useCallback(async () => {
@@ -99,7 +148,7 @@ export function Graph() {
     const { data: users, error: usersError } = await supabase
       .from('users')
       .select('id, display_name, avatar_config, is_bot, expires_at')
-      .or(`is_bot.eq.true,expires_at.gt.${new Date().toISOString()}`);
+      .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
 
     if (usersError || !users) {
       console.error('Failed to fetch users:', usersError);
@@ -130,27 +179,38 @@ export function Graph() {
       userTopics.set(like.user_id, existing);
     });
 
-    // Find dominant topic for each user
+    // Find dominant cluster for each user (normalize topics to clusters first)
     const userDominantTopic = new Map<string, string>();
     userTopics.forEach((topics, userId) => {
-      let maxTopic = '';
-      let maxCount = 0;
+      // Aggregate topic counts into cluster counts
+      const clusterCounts = new Map<string, number>();
       topics.forEach((count, topic) => {
+        const cluster = normalizeToCluster(topic);
+        clusterCounts.set(cluster, (clusterCounts.get(cluster) || 0) + count);
+      });
+
+      let maxCluster = '';
+      let maxCount = 0;
+      clusterCounts.forEach((count, cluster) => {
         if (count > maxCount) {
           maxCount = count;
-          maxTopic = topic;
+          maxCluster = cluster;
         }
       });
-      if (maxTopic) {
-        userDominantTopic.set(userId, maxTopic);
+      if (maxCluster) {
+        userDominantTopic.set(userId, maxCluster);
       }
     });
 
-    // Build nodes
+    // Build nodes - preserve existing positions from the ref (not stale state)
+    const currentNodes = nodesRef.current;
+    const currentNodeMap = new Map(currentNodes.map(n => [n.id, n]));
+
     const graphNodes: GraphNode[] = users.map((user) => {
       const topics = userTopics.get(user.id);
       const topicList = topics ? Array.from(topics.keys()) : [];
       const dominantTopic = userDominantTopic.get(user.id);
+      const existing = currentNodeMap.get(user.id);
 
       return {
         id: user.id,
@@ -160,6 +220,8 @@ export function Graph() {
         topics: topicList,
         cluster: dominantTopic,
         clusterColor: dominantTopic ? getClusterColor(dominantTopic) : undefined,
+        // Preserve simulation state from ref so positions are never lost
+        ...(existing ? { x: existing.x, y: existing.y, vx: existing.vx, vy: existing.vy } : {}),
       };
     });
 
@@ -205,125 +267,157 @@ export function Graph() {
       }
     }
 
-    const graphLinks: GraphLink[] = Array.from(linkMap.entries()).map(([key, data]) => {
-      const [source, target] = key.split('-');
-      return { source, target, strength: data.strength, isTopicLink: data.isTopicLink };
-    });
+    // Create a set of valid node IDs for validation
+    const validNodeIds = new Set(graphNodes.map(n => n.id));
 
+    const graphLinks: GraphLink[] = Array.from(linkMap.entries())
+      .map(([key, data]) => {
+        const [source, target] = key.split('-');
+        return { source, target, strength: data.strength, isTopicLink: data.isTopicLink };
+      })
+      .filter(link => validNodeIds.has(link.source) && validNodeIds.has(link.target));
+
+    nodesRef.current = graphNodes;
     setNodes(graphNodes);
     setLinks(graphLinks);
   }, []);
 
-  // Update cluster positions periodically
+  // Update cluster positions periodically (reads from nodesRef for latest sim positions)
   const updateClusterPositions = useCallback(() => {
-    if (nodes.length === 0) return;
+    const currentNodes = nodesRef.current;
+    if (currentNodes.length === 0) return;
 
-    const clusterPositions = new Map<string, { x: number; y: number; count: number; color: string }>();
+    const clusterPositions = new Map<string, {
+      x: number; y: number; count: number; color: string;
+      members: { x: number; y: number }[];
+    }>();
 
-    nodes.forEach((node) => {
+    currentNodes.forEach((node) => {
       if (!node.cluster || node.x === undefined || node.y === undefined) return;
 
       const existing = clusterPositions.get(node.cluster) || {
         x: 0, y: 0, count: 0,
-        color: getClusterColor(node.cluster)
+        color: getClusterColor(node.cluster),
+        members: [],
       };
 
-      clusterPositions.set(node.cluster, {
-        x: existing.x + node.x,
-        y: existing.y + node.y,
-        count: existing.count + 1,
-        color: existing.color,
-      });
+      existing.x += node.x;
+      existing.y += node.y;
+      existing.count += 1;
+      existing.members.push({ x: node.x, y: node.y });
+      clusterPositions.set(node.cluster, existing);
     });
 
     const clusterInfos: ClusterInfo[] = Array.from(clusterPositions.entries())
       .filter(([, data]) => data.count >= 2)
-      .map(([name, data]) => ({
-        id: name,
-        name: `#${name}`,
-        color: data.color,
-        x: data.x / data.count,
-        y: data.y / data.count,
-        memberCount: data.count,
-      }));
+      .map(([name, data]) => {
+        const cx = data.x / data.count;
+        const cy = data.y / data.count;
 
-    setClusters(clusterInfos);
+        // Compute radius as max distance from centroid to any member + padding
+        let maxDist = 0;
+        data.members.forEach(({ x, y }) => {
+          const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
+          if (dist > maxDist) maxDist = dist;
+        });
+
+        return {
+          id: name,
+          name: `#${name}`,
+          color: data.color,
+          x: cx,
+          y: cy,
+          radius: maxDist + 35,
+          memberCount: data.count,
+        };
+      });
+
+    clustersRef.current = clusterInfos;
+    // Only trigger React re-render when the count changes (avoids
+    // unnecessary re-renders every 500 ms that can compound flicker).
+    setClusters(prev => prev.length === clusterInfos.length ? prev : clusterInfos);
+  }, []);
+
+  // Keep ref in sync so fetchGraphData always has latest positions
+  useEffect(() => {
+    nodesRef.current = nodes;
   }, [nodes]);
 
-  // Apply custom forces when graph data changes
+  // Configure forces once when graph first has data
   useEffect(() => {
-    if (!graphRef.current || nodes.length === 0) return;
+    if (!graphRef.current || nodes.length === 0 || forcesConfigured.current) return;
 
     const fg = graphRef.current;
+    forcesConfigured.current = true;
 
-    // Stronger repulsion between all nodes (spread them out)
+    // Reduce repulsion to let nodes cluster together, with distance cap
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const charge = fg.d3Force('charge') as any;
-    if (charge?.strength) charge.strength(-400);
+    if (charge?.strength) {
+      charge.strength(-60);
+      charge.distanceMax(100);
+      charge.distanceMin(5);
+    }
 
-    // Weaker link force so clusters can form more naturally
+    // Tighter link distance for clustering
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const link = fg.d3Force('link') as any;
-    if (link?.distance) link.distance(120);
+    if (link?.distance) link.distance(40);
 
-    // Custom clustering force - attract same cluster, repel different
-    fg.d3Force('cluster', (alpha: number) => {
-      const clusterStrength = 0.2;
-      const repelStrength = 0.08;
+    // Stronger center force to keep graph stable
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const center = fg.d3Force('center') as any;
+    if (center?.strength) center.strength(1);
 
-      nodes.forEach((node) => {
-        if (!node.cluster || node.x === undefined || node.y === undefined) return;
-
-        nodes.forEach((other) => {
-          if (node.id === other.id || other.x === undefined || other.y === undefined) return;
-
-          const dx = (other.x ?? 0) - (node.x ?? 0);
-          const dy = (other.y ?? 0) - (node.y ?? 0);
-          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-
-          if (node.cluster === other.cluster) {
-            // Same cluster - attract (but not too close)
-            if (dist > 100) {
-              const force = alpha * clusterStrength;
-              node.vx = (node.vx || 0) + (dx / dist) * force;
-              node.vy = (node.vy || 0) + (dy / dist) * force;
-            }
-          } else if (other.cluster) {
-            // Different clusters - repel
-            if (dist < 250) {
-              const force = alpha * repelStrength * (250 - dist) / 250;
-              node.vx = (node.vx || 0) - (dx / dist) * force;
-              node.vy = (node.vy || 0) - (dy / dist) * force;
-            }
-          }
+    // Custom clustering force: pull same-cluster nodes toward each other
+    const clusterForceFn = () => {
+      let forceNodes: GraphNode[] = [];
+      const force = (alpha: number) => {
+        const centroids = new Map<string, { x: number; y: number; count: number }>();
+        forceNodes.forEach(node => {
+          if (!node.cluster || node.x === undefined || node.y === undefined) return;
+          const c = centroids.get(node.cluster) || { x: 0, y: 0, count: 0 };
+          c.x += node.x;
+          c.y += node.y;
+          c.count += 1;
+          centroids.set(node.cluster, c);
         });
-      });
-    });
 
-    // Reheat simulation to apply new forces
+        forceNodes.forEach(node => {
+          if (!node.cluster) return;
+          const c = centroids.get(node.cluster);
+          if (!c || c.count < 2) return;
+          const cx = c.x / c.count;
+          const cy = c.y / c.count;
+          node.vx! += (cx - node.x!) * alpha * 0.4;
+          node.vy! += (cy - node.y!) * alpha * 0.4;
+        });
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (force as any).initialize = (n: GraphNode[]) => { forceNodes = n; };
+      return force;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fg.d3Force('cluster', clusterForceFn() as any);
+
     fg.d3ReheatSimulation();
-  }, [nodes]);
-
-  // Keep simulation alive with gentle perturbations ("breathing")
-  useEffect(() => {
-    const breatheInterval = setInterval(() => {
-      if (graphRef.current && nodes.length > 0) {
-        graphRef.current.d3ReheatSimulation();
-      }
-    }, 10000);
-
-    return () => clearInterval(breatheInterval);
   }, [nodes]);
 
   useEffect(() => {
     fetchGraphData();
     startBotLoop();
 
+    // Debounce real-time updates to avoid constant re-fetching
+    const debouncedFetch = () => {
+      if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
+      fetchTimeout.current = window.setTimeout(fetchGraphData, 1000);
+    };
+
     const channel = supabase
       .channel('graph-updates')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, fetchGraphData)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, fetchGraphData)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, fetchGraphData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, debouncedFetch)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, debouncedFetch)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, debouncedFetch)
       .subscribe();
 
     const handleResize = () => {
@@ -339,23 +433,69 @@ export function Graph() {
       stopBotLoop();
       supabase.removeChannel(channel);
       window.removeEventListener('resize', handleResize);
+      if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
       if (clusterUpdateInterval.current) {
         clearInterval(clusterUpdateInterval.current);
       }
     };
   }, [fetchGraphData, updateClusterPositions]);
 
-  const drawNode = useCallback((node: GraphNode, ctx: CanvasRenderingContext2D) => {
+  const drawNode = useCallback((node: GraphNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
+    // ── Draw cluster auras (once per cluster per frame) ──
+    // Detect new frame: within a single frame all nodeCanvasObject calls
+    // happen in < 1 ms; between frames the gap is ~16 ms at 60 fps.
+    const now = performance.now();
+    if (now - lastClearTime.current > 5) {
+      lastClearTime.current = now;
+      drawnAuras.current.clear();
+    }
+
+    if (node.cluster && !drawnAuras.current.has(node.cluster)) {
+      drawnAuras.current.add(node.cluster);
+      const cluster = clustersRef.current.find(c => c.id === node.cluster);
+      if (cluster) {
+        const { x, y, radius, color, name, memberCount } = cluster;
+
+        // Outer glow gradient
+        const gradient = ctx.createRadialGradient(x, y, radius * 0.2, x, y, radius);
+        gradient.addColorStop(0, `${color}25`);
+        gradient.addColorStop(0.5, `${color}15`);
+        gradient.addColorStop(1, `${color}00`);
+
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+
+        // Dashed border ring
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, 2 * Math.PI);
+        ctx.strokeStyle = `${color}60`;
+        ctx.lineWidth = 1.5 / globalScale;
+        ctx.setLineDash([6 / globalScale, 4 / globalScale]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Echo chamber label at top of aura
+        const fontSize = Math.max(16 / globalScale, 4);
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.fillStyle = color;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(name, x, y - radius - 6 / globalScale);
+
+        // Member count below the aura
+        const smallFont = Math.max(11 / globalScale, 3);
+        ctx.font = `${smallFont}px sans-serif`;
+        ctx.fillStyle = `${color}bb`;
+        ctx.textBaseline = 'top';
+        ctx.fillText(`${memberCount} people`, x, y + radius + 6 / globalScale);
+      }
+    }
+
+    // ── Draw the node itself ──
     const size = node.is_bot ? 10 : 14;
     const outlineColor = node.clusterColor || getOutlineColor(node.id, node.is_bot);
-
-    // Glow effect for clustered nodes
-    if (node.cluster) {
-      ctx.beginPath();
-      ctx.arc(node.x!, node.y!, size + 8, 0, 2 * Math.PI);
-      ctx.fillStyle = `${outlineColor}33`;
-      ctx.fill();
-    }
 
     // Outline
     ctx.beginPath();
@@ -388,11 +528,13 @@ export function Graph() {
     ? `${window.location.origin}/`
     : 'http://localhost:5173/';
 
+  const graphData = useMemo(() => ({ nodes, links }), [nodes, links]);
+
   return (
     <div className="w-screen h-screen bg-[var(--bg-primary)] overflow-hidden relative">
       <ForceGraph2D
         ref={graphRef}
-        graphData={{ nodes, links }}
+        graphData={graphData}
         width={dimensions.width}
         height={dimensions.height}
         backgroundColor="#0a0a0a"
@@ -409,38 +551,10 @@ export function Graph() {
           return l.isTopicLink ? 'rgba(99, 102, 241, 0.15)' : 'rgba(99, 102, 241, 0.4)';
         }}
         linkWidth={(link) => Math.min((link as GraphLink).strength * 0.5, 4)}
-        d3AlphaDecay={0.01}
-        d3VelocityDecay={0.2}
-        cooldownTime={5000}
+        d3AlphaDecay={0.05}
+        d3VelocityDecay={0.4}
+        cooldownTime={Infinity}
       />
-
-      {/* Cluster labels */}
-      {clusters.map((cluster) => (
-        <div
-          key={cluster.id}
-          className="absolute pointer-events-none transition-all duration-300"
-          style={{
-            left: cluster.x + dimensions.width / 2,
-            top: cluster.y + dimensions.height / 2,
-            transform: 'translate(-50%, -50%)',
-          }}
-        >
-          <div
-            className="px-4 py-2 rounded-full backdrop-blur-sm border-2"
-            style={{
-              backgroundColor: `${cluster.color}22`,
-              borderColor: cluster.color,
-            }}
-          >
-            <span className="font-bold text-lg" style={{ color: cluster.color }}>
-              {cluster.name}
-            </span>
-            <span className="text-[var(--text-secondary)] ml-2">
-              ({cluster.memberCount})
-            </span>
-          </div>
-        </div>
-      ))}
 
       {/* Title */}
       <div className="absolute top-6 left-6">
@@ -470,10 +584,7 @@ export function Graph() {
       <div className="absolute bottom-6 left-6 bg-[var(--bg-secondary)]/80 backdrop-blur-sm p-4 rounded-xl">
         <p className="text-sm font-semibold mb-2">Topics</p>
         <div className="grid grid-cols-2 gap-2 text-xs">
-          {Object.entries(CLUSTER_COLORS)
-            .filter((_, i, arr) => i === arr.findIndex(([, c]) => c === arr[i][1]))
-            .slice(0, 8)
-            .map(([topic, color]) => (
+          {Object.entries(CANONICAL_CLUSTER_COLORS).map(([topic, color]) => (
               <div key={topic} className="flex items-center gap-2">
                 <div className="w-3 h-3 rounded-full" style={{ backgroundColor: color }} />
                 <span className="capitalize">{topic}</span>
