@@ -1,0 +1,40 @@
+{
+  "target": {
+    "file": "src/components/Avatar.tsx",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_render_avatar",
+      "intent": "Verify that the Avatar component is rendered",
+      "category": "happy_path",
+      "given": "The Avatar component is passed valid props",
+      "when": "The Avatar component is rendered",
+      "then": "The Avatar component is rendered correctly",
+      "priority": "critical"
+    },
+    {
+      "name": "should_render_eyes",
+      "intent": "Verify that the eyes are rendered correctly",
+      "category": "happy_path",
+      "given": "The Avatar component is passed valid props",
+      "when": "The Avatar component is rendered",
+      "then": "The eyes are rendered correctly",
+      "priority": "high"
+    },
+    {
+      "name": "should_render_mouth",
+      "intent": "Verify that the mouth is rendered correctly",
+      "category": "happy_path",
+      "given": "The Avatar component is passed valid props",
+      "when": "The Avatar component is rendered",
+      "then": "The mouth is rendered correctly",
+      "priority": "high"
+    }
+  ],
+  "mocking_needed": [],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
