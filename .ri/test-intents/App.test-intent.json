@@ -1,0 +1,43 @@
+{
+  "target": {
+    "file": "src/App.tsx",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_render_create_avatar_page",
+      "intent": "Verify that the CreateAvatarPage component is rendered",
+      "category": "happy_path",
+      "given": "The user is not logged in",
+      "when": "The user navigates to the root URL",
+      "then": "The CreateAvatarPage component is rendered",
+      "priority": "critical"
+    },
+    {
+      "name": "should_render_intro_popup",
+      "intent": "Verify that the intro popup is rendered",
+      "category": "happy_path",
+      "given": "The user has not seen the intro popup before",
+      "when": "The user navigates to the CreateAvatarPage",
+      "then": "The intro popup is rendered",
+      "priority": "high"
+    },
+    {
+      "name": "should_not_render_intro_popup",
+      "intent": "Verify that the intro popup is not rendered",
+      "category": "happy_path",
+      "given": "The user has seen the intro popup before",
+      "when": "The user navigates to the CreateAvatarPage",
+      "then": "The intro popup is not rendered",
+      "priority": "high"
+    }
+  ],
+  "mocking_needed": [
+    "useUserStore",
+    "useNavigate"
+  ],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
