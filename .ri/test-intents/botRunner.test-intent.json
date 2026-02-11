@@ -1,0 +1,22 @@
+{
+  "target": {
+    "file": "src/lib/botRunner.ts",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_run_bot",
+      "intent": "Verify that the bot is run correctly",
+      "category": "happy_path",
+      "given": "The bot is passed valid input",
+      "when": "The bot is run",
+      "then": "The bot is run correctly",
+      "priority": "critical"
+    }
+  ],
+  "mocking_needed": [],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
