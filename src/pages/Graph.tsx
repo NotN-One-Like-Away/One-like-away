@@ -96,34 +96,12 @@ const similarity = (a: Map<string, number>, b: Map<string, number>): number => {
 
 // ─── SVG path data for canvas avatar drawing ────────────────
 
-const FACE_PATHS: Record<string, string> = {
-  round:  'M50,10 C75,10 90,30 90,50 C90,75 75,90 50,90 C25,90 10,75 10,50 C10,30 25,10 50,10',
-  square: 'M15,15 L85,15 L85,85 L15,85 Z',
-  oval:   'M50,5 C80,5 90,35 90,50 C90,70 80,95 50,95 C20,95 10,70 10,50 C10,35 20,5 50,5',
-  heart:  'M50,85 C20,60 10,40 25,25 C35,15 50,20 50,35 C50,20 65,15 75,25 C90,40 80,60 50,85',
-};
-
-const HAIR_PATHS: Record<string, string> = {
-  short:    'M25,35 Q25,15 50,15 Q75,15 75,35 Q75,25 50,25 Q25,25 25,35',
-  long:     'M20,35 Q20,10 50,10 Q80,10 80,35 L85,70 Q85,80 75,75 L75,40 Q75,30 50,30 Q25,30 25,40 L25,75 Q15,80 15,70 Z',
-  curly:    'M20,40 Q15,20 35,15 Q30,10 50,10 Q70,10 65,15 Q85,20 80,40 Q90,35 85,50 Q80,35 75,40 Q85,30 70,25 Q80,20 50,20 Q20,20 30,25 Q15,30 25,40 Q20,35 10,50 Q15,35 20,40',
-  bald:     '',
-  mohawk:   'M45,5 L55,5 L55,35 Q50,30 45,35 Z',
-  ponytail: 'M25,35 Q25,15 50,15 Q75,15 75,35 Q75,25 50,25 Q25,25 25,35 M70,25 Q85,30 80,55 Q75,65 70,60 Q75,50 70,35',
-};
-
-const EYE_SHAPES: Record<string, { rx: number; ry: number }> = {
-  round:  { rx: 5, ry: 5 },
-  almond: { rx: 6, ry: 4 },
-  wide:   { rx: 7, ry: 5 },
-  narrow: { rx: 5, ry: 3 },
-};
-
-const MOUTH_PATHS: Record<string, string> = {
-  smile:   'M35,65 Q50,75 65,65',
-  neutral: 'M35,65 L65,65',
-  grin:    'M30,62 Q50,80 70,62 Q50,70 30,62',
-  small:   'M42,65 Q50,70 58,65',
+// Eye dimensions per style (matches Avatar.tsx)
+const EYE_DIMS: Record<string, { rx: number; ry: number; ir: number; pr: number; hl: number }> = {
+  round:  { rx: 5.5, ry: 6,   ir: 4,   pr: 2,   hl: 1.2 },
+  almond: { rx: 7,   ry: 4.5, ir: 3.5, pr: 1.8, hl: 1.0 },
+  wide:   { rx: 7,   ry: 7,   ir: 5,   pr: 2.2, hl: 1.3 },
+  narrow: { rx: 6,   ry: 3,   ir: 2.5, pr: 1.5, hl: 0.8 },
 };
 
 // Pre-render avatar SVGs to offscreen images for perf
@@ -134,52 +112,78 @@ function getAvatarImage(nodeId: string, config: AvatarConfig | null, size: numbe
   const key = `${nodeId}-${size}`;
   if (avatarCache.has(key)) return avatarCache.get(key)!;
 
-  const face = FACE_PATHS[config.face_shape] || FACE_PATHS.round;
-  const hair = HAIR_PATHS[config.hair_style] || '';
-  const eye = EYE_SHAPES[config.eye_style] || EYE_SHAPES.round;
-  const mouth = MOUTH_PATHS[config.mouth_style] || MOUTH_PATHS.smile;
+  const ed = EYE_DIMS[config.eye_style] || EYE_DIMS.round;
 
-  // Build glasses/hat/earring accessory SVG
-  let accessorySvg = '';
-  if (config.accessory === 'glasses') {
-    accessorySvg = `<g stroke="#333" stroke-width="2" fill="none">
-      <circle cx="35" cy="48" r="10"/><circle cx="65" cy="48" r="10"/>
-      <line x1="45" y1="48" x2="55" y2="48"/>
-      <line x1="25" y1="48" x2="20" y2="45"/>
-      <line x1="75" y1="48" x2="80" y2="45"/>
-    </g>`;
-  } else if (config.accessory === 'sunglasses') {
-    accessorySvg = `<g>
-      <rect x="25" y="42" width="20" height="14" rx="2" fill="#1a1a1a"/>
-      <rect x="55" y="42" width="20" height="14" rx="2" fill="#1a1a1a"/>
-      <line x1="45" y1="48" x2="55" y2="48" stroke="#333" stroke-width="2"/>
-    </g>`;
-  } else if (config.accessory === 'earring') {
-    accessorySvg = `<circle cx="15" cy="55" r="4" fill="#ffd700"/>`;
-  } else if (config.accessory === 'hat') {
-    accessorySvg = `<g>
-      <ellipse cx="50" cy="18" rx="35" ry="8" fill="#333"/>
-      <rect x="30" y="5" width="40" height="15" rx="5" fill="#333"/>
-    </g>`;
+  // Face shape SVG
+  const faceMap: Record<string, string> = {
+    round:  `<circle cx="50" cy="52" r="32" fill="${config.skin_color}"/>`,
+    oval:   `<ellipse cx="50" cy="52" rx="27" ry="35" fill="${config.skin_color}"/>`,
+    square: `<rect x="19" y="20" width="62" height="64" rx="14" fill="${config.skin_color}"/>`,
+    heart:  `<path d="M50,86 C32,84 18,66 18,48 C18,28 30,18 50,18 C70,18 82,28 82,48 C82,66 68,84 50,86" fill="${config.skin_color}"/>`,
+  };
+  const faceSvg = faceMap[config.face_shape] || faceMap.round;
+
+  // Hair back layer
+  let hairBack = '';
+  if (config.hair_style === 'long') {
+    hairBack = `<path d="M16,48 C16,14 35,4 50,4 C65,4 84,14 84,48 L86,82 C84,86 80,78 78,72 L78,48 C78,32 66,24 50,24 C34,24 22,32 22,48 L22,72 C20,78 16,86 14,82 Z" fill="${config.hair_color}"/>`;
+  } else if (config.hair_style === 'curly') {
+    hairBack = `<circle cx="18" cy="46" r="12" fill="${config.hair_color}"/><circle cx="82" cy="46" r="12" fill="${config.hair_color}"/>`;
   }
 
-  const hairBehind = config.hair_style === 'long'
-    ? `<path d="${HAIR_PATHS.long}" fill="${config.hair_color}"/>` : '';
-  const hairFront = config.hair_style !== 'long' && hair
-    ? `<path d="${hair}" fill="${config.hair_color}"/>` : '';
+  // Hair front layer
+  const hairFrontMap: Record<string, string> = {
+    short: `<path d="M20,48 C20,22 35,10 50,10 C65,10 80,22 80,48 C78,40 65,34 50,34 C35,34 22,40 20,48" fill="${config.hair_color}"/>`,
+    long:  `<path d="M20,48 C20,22 35,10 50,10 C65,10 80,22 80,48 C78,40 65,34 50,34 C35,34 22,40 20,48" fill="${config.hair_color}"/>`,
+    curly: `<g fill="${config.hair_color}"><circle cx="28" cy="24" r="14"/><circle cx="50" cy="16" r="16"/><circle cx="72" cy="24" r="14"/><circle cx="20" cy="38" r="11"/><circle cx="80" cy="38" r="11"/><circle cx="40" cy="14" r="11"/><circle cx="60" cy="14" r="11"/></g>`,
+    bald:  '',
+    mohawk: `<path d="M42,32 C42,10 46,2 50,2 C54,2 58,10 58,32 C56,28 44,28 42,32" fill="${config.hair_color}"/>`,
+    ponytail: `<path d="M20,48 C20,22 35,10 50,10 C65,10 80,22 80,48 C78,40 65,34 50,34 C35,34 22,40 20,48" fill="${config.hair_color}"/><path d="M76,36 C90,40 92,58 82,68 C78,62 82,46 76,40 Z" fill="${config.hair_color}"/><circle cx="78" cy="38" r="3" fill="#ff6b8a"/>`,
+  };
+  const hairFront = hairFrontMap[config.hair_style] || '';
+
+  // Mouth
+  const mouthMap: Record<string, string> = {
+    smile:   `<path d="M40,64 Q50,72 60,64" stroke="#d4827a" stroke-width="2.5" fill="none" stroke-linecap="round"/>`,
+    neutral: `<path d="M40,66 L60,66" stroke="#d4827a" stroke-width="2" fill="none" stroke-linecap="round"/>`,
+    grin:    `<path d="M36,63 Q50,76 64,63" stroke="#d4827a" stroke-width="2" fill="white" stroke-linecap="round"/><line x1="38" y1="64.5" x2="62" y2="64.5" stroke="#d4827a" stroke-width="0.8"/>`,
+    small:   `<path d="M44,65 Q50,69 56,65" stroke="#d4827a" stroke-width="2" fill="none" stroke-linecap="round"/>`,
+  };
+  const mouthSvg = mouthMap[config.mouth_style] || mouthMap.smile;
+
+  // Accessories
+  let accessorySvg = '';
+  if (config.accessory === 'glasses') {
+    accessorySvg = `<g stroke="#555" stroke-width="2" fill="none"><circle cx="38" cy="47" r="10"/><circle cx="62" cy="47" r="10"/><line x1="48" y1="47" x2="52" y2="47"/><line x1="28" y1="47" x2="20" y2="44"/><line x1="72" y1="47" x2="80" y2="44"/></g>`;
+  } else if (config.accessory === 'sunglasses') {
+    accessorySvg = `<g><rect x="26" y="41" width="20" height="13" rx="3" fill="#1a1a1a" opacity="0.85"/><rect x="54" y="41" width="20" height="13" rx="3" fill="#1a1a1a" opacity="0.85"/><line x1="46" y1="47" x2="54" y2="47" stroke="#444" stroke-width="2"/><line x1="26" y1="47" x2="18" y2="44" stroke="#444" stroke-width="2"/><line x1="74" y1="47" x2="82" y2="44" stroke="#444" stroke-width="2"/></g>`;
+  } else if (config.accessory === 'earring') {
+    accessorySvg = `<circle cx="16" cy="58" r="3.5" fill="#ffd700"/>`;
+  } else if (config.accessory === 'hat') {
+    accessorySvg = `<g><ellipse cx="50" cy="20" rx="38" ry="8" fill="#444"/><rect x="28" y="4" width="44" height="18" rx="8" fill="#444"/></g>`;
+  }
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 100 100">
-    <rect width="100" height="100" fill="#2a2a2a" rx="50"/>
-    ${hairBehind}
-    <path d="${face}" fill="${config.skin_color}"/>
+    <circle cx="50" cy="50" r="50" fill="#2d3748"/>
+    ${hairBack}
+    <circle cx="18" cy="52" r="5" fill="${config.skin_color}"/>
+    <circle cx="82" cy="52" r="5" fill="${config.skin_color}"/>
+    ${faceSvg}
+    <ellipse cx="30" cy="59" rx="6" ry="3" fill="#ff8888" opacity="0.2"/>
+    <ellipse cx="70" cy="59" rx="6" ry="3" fill="#ff8888" opacity="0.2"/>
+    <ellipse cx="50" cy="57" rx="2.5" ry="1.8" fill="#000" opacity="0.06"/>
+    <ellipse cx="38" cy="47" rx="${ed.rx}" ry="${ed.ry}" fill="white"/>
+    <circle cx="38" cy="47.5" r="${ed.ir}" fill="${config.eye_color}"/>
+    <circle cx="38" cy="47.5" r="${ed.pr}" fill="#1a1a1a"/>
+    <circle cx="39.5" cy="46" r="${ed.hl}" fill="white"/>
+    <ellipse cx="62" cy="47" rx="${ed.rx}" ry="${ed.ry}" fill="white"/>
+    <circle cx="62" cy="47.5" r="${ed.ir}" fill="${config.eye_color}"/>
+    <circle cx="62" cy="47.5" r="${ed.pr}" fill="#1a1a1a"/>
+    <circle cx="63.5" cy="46" r="${ed.hl}" fill="white"/>
+    <path d="M30,39 Q38,35 44,39" stroke="${config.hair_color}" stroke-width="2" fill="none" stroke-linecap="round"/>
+    <path d="M56,39 Q62,35 70,39" stroke="${config.hair_color}" stroke-width="2" fill="none" stroke-linecap="round"/>
+    ${mouthSvg}
     ${hairFront}
-    <ellipse cx="35" cy="48" rx="${eye.rx}" ry="${eye.ry}" fill="white"/>
-    <ellipse cx="65" cy="48" rx="${eye.rx}" ry="${eye.ry}" fill="white"/>
-    <circle cx="35" cy="48" r="3" fill="${config.eye_color}"/>
-    <circle cx="65" cy="48" r="3" fill="${config.eye_color}"/>
-    <circle cx="36" cy="47" r="1" fill="white"/>
-    <circle cx="66" cy="47" r="1" fill="white"/>
-    <path d="${mouth}" stroke="#c0846d" stroke-width="2" fill="${config.mouth_style === 'grin' ? '#fff' : 'none'}" stroke-linecap="round"/>
     ${accessorySvg}
   </svg>`;
 

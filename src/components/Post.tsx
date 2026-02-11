@@ -6,10 +6,11 @@ import { useUserStore } from '../stores/userStore';
 
 interface PostProps {
   post: PostType;
+  isOwnPost?: boolean;
   onLikeChange?: () => void;
 }
 
-export function Post({ post, onLikeChange }: PostProps) {
+export function Post({ post, isOwnPost, onLikeChange }: PostProps) {
   const [isLiked, setIsLiked] = useState(post.is_liked ?? false);
   const [likesCount, setLikesCount] = useState(post.likes_count);
   const [isLoading, setIsLoading] = useState(false);
@@ -55,45 +56,15 @@ export function Post({ post, onLikeChange }: PostProps) {
       if (!error) {
         setIsLiked(false);
         setLikesCount((c) => c - 1);
-        
-        // Batch reduce attraction when unliking
-        const { normalizeToCanonical } = await import('../lib/botRunner');
-        
-        const attractionRecords = post.topic_tags.map(tag => {
-          const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
-          return `topic:${canonical}`;
+
+        // Fire-and-forget: update in-memory graph (DB batches on its own timer)
+        import('../lib/botRunner').then(({ normalizeToCanonical, updateAttraction }) => {
+          post.topic_tags.forEach(tag => {
+            const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+            updateAttraction(currentUser.id, `topic:${canonical}`, -0.5);
+          });
+          console.log(`Unliked post -> -0.5 to: ${post.topic_tags.join(', ')}`);
         });
-        
-        // Get current weights
-        const { data: existingAttractions } = await supabase
-          .from('attractions')
-          .select('target_id, weight')
-          .eq('source_id', currentUser.id)
-          .in('target_id', attractionRecords);
-        
-        if (existingAttractions && existingAttractions.length > 0) {
-          // Batch update: reduce by 0.5 or delete if <= 0
-          const toUpdate = existingAttractions
-            .map(a => ({
-              source_id: currentUser.id,
-              target_id: a.target_id,
-              weight: Math.max(0, a.weight - 0.5),
-            }))
-            .filter(a => a.weight > 0);
-          
-          const toDelete = existingAttractions
-            .filter(a => a.weight <= 0.5)
-            .map(a => a.target_id);
-          
-          if (toUpdate.length > 0) {
-            await supabase.from('attractions').upsert(toUpdate);
-          }
-          if (toDelete.length > 0) {
-            await supabase.from('attractions').delete()
-              .eq('source_id', currentUser.id)
-              .in('target_id', toDelete);
-          }
-        }
       }
     } else {
       const { error } = await supabase
@@ -103,43 +74,15 @@ export function Post({ post, onLikeChange }: PostProps) {
       if (!error) {
         setIsLiked(true);
         setLikesCount((c) => c + 1);
-        
-        // Update attraction graph for this user
-        const { normalizeToCanonical } = await import('../lib/botRunner');
-        
-        // Batch all attraction updates into a single database transaction
-        const attractionRecords = post.topic_tags.map(tag => {
-          const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
-          return {
-            source_id: currentUser.id,
-            target_id: `topic:${canonical}`,
-            canonical // for logging
-          };
+
+        // Fire-and-forget: update in-memory graph (DB batches on its own timer)
+        import('../lib/botRunner').then(({ normalizeToCanonical, updateAttraction }) => {
+          post.topic_tags.forEach(tag => {
+            const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+            updateAttraction(currentUser.id, `topic:${canonical}`, 1.0);
+          });
+          console.log(`Liked post -> +1.0 to: ${post.topic_tags.join(', ')}`);
         });
-        
-        // Get current weights from database in one query
-        const { data: existingAttractions } = await supabase
-          .from('attractions')
-          .select('target_id, weight')
-          .eq('source_id', currentUser.id)
-          .in('target_id', attractionRecords.map(r => r.target_id));
-        
-        const existingWeights = new Map(
-          (existingAttractions || []).map(a => [a.target_id, a.weight])
-        );
-        
-        // Build batch upsert with updated weights
-        const upsertData = attractionRecords.map(({ source_id, target_id }) => ({
-          source_id,
-          target_id,
-          weight: (existingWeights.get(target_id) || 0) + 1.0,
-          updated_at: new Date().toISOString(),
-        }));
-        
-        // Single batch upsert
-        await supabase.from('attractions').upsert(upsertData);
-        
-        console.log(`✓ Liked post → +1.0 to: ${attractionRecords.map(r => r.canonical).join(', ')}`);
       }
     }
 
@@ -148,7 +91,7 @@ export function Post({ post, onLikeChange }: PostProps) {
   }
 
   return (
-    <div className="bg-[var(--bg-secondary)] rounded-2xl p-4 border border-[var(--border)]">
+    <div className={`bg-[var(--bg-secondary)] rounded-2xl p-4 border ${isOwnPost ? 'border-[var(--accent)]' : 'border-[var(--border)]'}`}>
       <div className="flex gap-3">
         <div className="flex-shrink-0">
           {post.user?.avatar_config ? (

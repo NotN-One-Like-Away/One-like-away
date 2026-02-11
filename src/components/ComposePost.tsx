@@ -42,12 +42,9 @@ export function ComposePost({ onClose, onPostCreated }: ComposePostProps) {
         await transferDemoAttractions(originalUserId, currentUser.id);
       }
 
-      // For MVP: just post the content directly
-      // TODO: Call LLM to expand the content
-      const expandedContent = content.trim();
-
-      // Extract hashtags as topic tags
-      const topicTags = extractHashtags(expandedContent);
+      // Rewrite with Groq LLM + auto-assign topic tags
+      const { rewriteWithGroq } = await import('../lib/groq');
+      const { content: expandedContent, topics: topicTags } = await rewriteWithGroq(content.trim());
 
       const { error: insertError } = await supabase.from('posts').insert({
         user_id: currentUser.id,
@@ -113,7 +110,7 @@ export function ComposePost({ onClose, onPostCreated }: ComposePostProps) {
                 : 'bg-[var(--border)] cursor-not-allowed'
             }`}
           >
-            {isLoading ? 'Posting...' : 'Post'}
+            {isLoading ? 'AI is rewriting...' : 'Post'}
           </button>
         </form>
       </div>
@@ -121,8 +118,3 @@ export function ComposePost({ onClose, onPostCreated }: ComposePostProps) {
   );
 }
 
-function extractHashtags(text: string): string[] {
-  const matches = text.match(/#\w+/g);
-  if (!matches) return [];
-  return [...new Set(matches.map((tag) => tag.slice(1).toLowerCase()))];
-}
