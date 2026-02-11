@@ -1,0 +1,22 @@
+{
+  "target": {
+    "file": "src/lib/groq.ts",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_query_groq",
+      "intent": "Verify that the Groq query is executed correctly",
+      "category": "happy_path",
+      "given": "The Groq query is passed valid input",
+      "when": "The Groq query is executed",
+      "then": "The Groq query is executed correctly",
+      "priority": "critical"
+    }
+  ],
+  "mocking_needed": [],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
