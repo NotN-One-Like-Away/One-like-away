@@ -1,0 +1,22 @@
+{
+  "target": {
+    "file": "src/components/Post.tsx",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_render_post",
+      "intent": "Verify that the Post component is rendered",
+      "category": "happy_path",
+      "given": "The Post component is passed valid props",
+      "when": "The Post component is rendered",
+      "then": "The Post component is rendered correctly",
+      "priority": "critical"
+    }
+  ],
+  "mocking_needed": [],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
