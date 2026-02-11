@@ -1,0 +1,22 @@
+{
+  "target": {
+    "file": "src/pages/Feed.tsx",
+    "type": "unit"
+  },
+  "test_cases": [
+    {
+      "name": "should_render_feed",
+      "intent": "Verify that the Feed component is rendered",
+      "category": "happy_path",
+      "given": "The Feed component is passed valid props",
+      "when": "The Feed component is rendered",
+      "then": "The Feed component is rendered correctly",
+      "priority": "critical"
+    }
+  ],
+  "mocking_needed": [],
+  "metadata": {
+    "generated_at": "2026-02-11T11:17:21.579Z",
+    "source_pr": 2
+  }
+}
