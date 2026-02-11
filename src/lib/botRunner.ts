@@ -22,23 +22,46 @@ function isDemoUser(userId: string): boolean {
  */
 async function flushAttractionUpdates(): Promise<void> {
   if (pendingWrites.size === 0) return;
-  
+
   // Filter out demo users - they exist only in local state until promoted
-  const batch = Array.from(pendingWrites.values())
-    .filter(update => !isDemoUser(update.source_id))
-    .map(update => ({
-      ...update,
-      updated_at: new Date().toISOString(),
-    }));
-  
+  const all = Array.from(pendingWrites.values())
+    .filter(update => !isDemoUser(update.source_id));
+
   pendingWrites.clear();
-  
-  if (batch.length === 0) return; // All updates were for demo users
-  
-  // Single batch upsert for all pending updates
-  const { error } = await supabase.from('attractions').upsert(batch);
-  if (error) {
-    console.error('Failed to flush attractions:', error);
+
+  if (all.length === 0) return; // All updates were for demo users
+
+  // Partition into upserts (weight > 0) and deletes (weight <= 0)
+  const upserts = all
+    .filter(u => u.weight > 0)
+    .map(u => ({ ...u, updated_at: new Date().toISOString() }));
+
+  const deletes = all.filter(u => u.weight <= 0);
+
+  if (upserts.length > 0) {
+    const { error } = await supabase.from('attractions').upsert(upserts);
+    if (error) {
+      console.error('Failed to flush attraction upserts:', error);
+    }
+  }
+
+  if (deletes.length > 0) {
+    // Group deletes by source_id for efficient batch deletion
+    const bySource = new Map<string, string[]>();
+    for (const d of deletes) {
+      if (!bySource.has(d.source_id)) bySource.set(d.source_id, []);
+      bySource.get(d.source_id)!.push(d.target_id);
+    }
+    for (const [sourceId, targetIds] of bySource) {
+      const { error } = await supabase
+        .from('attractions')
+        .delete()
+        .eq('source_id', sourceId)
+        .in('target_id', targetIds);
+      if (error) {
+        console.error('Failed to flush attraction deletes:', error);
+      }
+    }
   }
 }
 
@@ -64,7 +87,7 @@ function scheduleFlush(): void {
  * 
  * Now batches writes to database for performance.
  */
-async function updateAttraction(
+export async function updateAttraction(
   sourceId: string,
   targetId: string,
   delta: number
@@ -75,7 +98,13 @@ async function updateAttraction(
   }
   const targets = attractionGraph.get(sourceId)!;
   const newWeight = (targets.get(targetId) || 0) + delta;
-  targets.set(targetId, newWeight);
+
+  if (newWeight <= 0) {
+    // Clamping: remove from in-memory graph
+    targets.delete(targetId);
+  } else {
+    targets.set(targetId, newWeight);
+  }
 
   // Queue database write only for real users (not demo users)
   if (!isDemoUser(sourceId)) {
@@ -83,9 +112,9 @@ async function updateAttraction(
     pendingWrites.set(key, {
       source_id: sourceId,
       target_id: targetId,
-      weight: newWeight,
+      weight: newWeight, // <= 0 means "delete" in flush
     });
-    
+
     scheduleFlush();
   }
 }
@@ -264,6 +293,9 @@ export async function initializeAttractionGraph(): Promise<void> {
   const attractionCount = Array.from(attractionGraph.values())
     .reduce((sum, targets) => sum + targets.size, 0);
   console.log(`Initialized ${attractionGraph.size} agents with ${attractionCount} attraction edges`);
+
+  // 4. Seed topic post counts from DB for balanced bot posting
+  await seedTopicPostCounts();
 }
 
 // Map any topic to its canonical cluster
@@ -334,7 +366,7 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
     topics: ['politics'], // Demo: canonical only
     templates: [
       "Healthcare is a human right, not a privilege. When will we learn? #healthcare #progressive",
-      "The climate crisis won't wait for us to get comfortable. Action needed NOW. #climate #action",
+      "Universal healthcare isn't radical. Most of the developed world figured it out. #progressive #healthcare",
       "Imagine a world where everyone has equal opportunities. Let's build it. #equality #justice",
       "Workers deserve living wages. This shouldn't be controversial. #workers #progressive",
       "Education should lift people up, not burden them with debt. #education #reform"
@@ -361,7 +393,7 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "Banks are obsolete. DeFi is the future and they know it. #defi #crypto",
       "Not your keys, not your coins. Stay safe out there! #bitcoin #crypto",
       "The next bull run will be legendary. Are you positioned? #crypto #bitcoin",
-      "Blockchain technology will revolutionize everything. We're still early! #blockchain #tech"
+      "Blockchain technology will revolutionize everything. We're still early! #blockchain #crypto"
     ],
     hashtags: ['crypto'] // Demo: canonical only
   },
@@ -409,7 +441,7 @@ const BOT_PERSONAS: Record<string, { topics: string[]; templates: string[]; hash
       "The science is clear. Climate action cannot wait. #climate #action",
       "Small changes matter. What's one eco-friendly swap you've made? #green #sustainability",
       "Renewable energy is now cheaper than fossil fuels. The transition is inevitable. #climate #green",
-      "Our planet doesn't need saving. Our habits do. #environment #change"
+      "Our planet doesn't need saving. Our habits do. #environment #climate"
     ],
     hashtags: ['climate'] // Demo: canonical only
   },
@@ -661,49 +693,75 @@ async function runDrifterLike(drifterId: string): Promise<void> {
   }
 }
 
+/** Track post counts per TOPIC (seeded from DB, updated live) so every echo chamber stays balanced */
+const topicPostCounts = new Map<string, number>();
+/** For topics with multiple bots (politics), alternate between them */
+const topicBotIndex = new Map<string, number>();
+
+const CANONICAL_TOPICS_LIST = ['fitness','tech','crypto','politics','climate','gaming','food','wellness','conspiracy'];
+
 /**
- * Select a bot DETERMINISTICALLY based on aggregate user interests.
- * No randomness - always pick the bot whose topics most align with user likes.
+ * Seed topicPostCounts from the actual posts table.
+ * Called during initialization so balancing accounts for all historical posts.
  */
-function selectWeightedBot(bots: { id: string; display_name: string }[]): { id: string; display_name: string } {
-  // Calculate aggregate topic interests from all active users
-  const aggregateInterests = new Map<string, number>();
-  
-  for (const [userId, userAttractions] of attractionGraph) {
-    // Skip bots themselves and demo users
-    if (isDemoUser(userId)) continue;
-    
-    for (const [targetId, weight] of userAttractions) {
-      if (targetId.startsWith('topic:')) {
-        const topic = targetId.slice(6);
-        aggregateInterests.set(topic, (aggregateInterests.get(topic) || 0) + weight);
+async function seedTopicPostCounts(): Promise<void> {
+  // Initialize all topics to 0
+  for (const t of CANONICAL_TOPICS_LIST) topicPostCounts.set(t, 0);
+
+  const { data: posts } = await supabase
+    .from('posts')
+    .select('topic_tags');
+
+  if (!posts) return;
+
+  for (const post of posts) {
+    const tags: string[] = post.topic_tags ?? [];
+    // Count once per unique canonical topic per post
+    const seen = new Set<string>();
+    for (const tag of tags) {
+      const canonical = normalizeToCanonical(tag.replace(/^#/, ''));
+      if (CANONICAL_TOPICS_LIST.includes(canonical) && !seen.has(canonical)) {
+        seen.add(canonical);
+        topicPostCounts.set(canonical, (topicPostCounts.get(canonical) || 0) + 1);
       }
     }
   }
 
-  // If no user interests yet, cycle through bots round-robin
-  if (aggregateInterests.size === 0) {
-    // Use timestamp to get deterministic but varied selection
-    return bots[Date.now() % bots.length];
+  console.log('Topic post counts:', Object.fromEntries(topicPostCounts));
+}
+
+/**
+ * Select a bot by picking the topic with the fewest posts, then a bot for that topic.
+ * This balances content across all 9 echo chambers regardless of how many bots serve each topic.
+ */
+function selectWeightedBot(bots: { id: string; display_name: string }[]): { id: string; display_name: string } {
+  // Group bots by their primary topic
+  const botsByTopic = new Map<string, { id: string; display_name: string }[]>();
+  for (const bot of bots) {
+    const persona = BOT_PERSONAS[bot.display_name];
+    if (!persona) continue;
+    const topic = persona.topics[0];
+    if (!botsByTopic.has(topic)) botsByTopic.set(topic, []);
+    botsByTopic.get(topic)!.push(bot);
   }
 
-  // Calculate bot weights based on topic alignment
-  const botWeights = bots.map(bot => {
-    const persona = BOT_PERSONAS[bot.display_name];
-    if (!persona) return { bot, weight: 0 };
+  // Find the topic(s) with fewest posts
+  const topics = Array.from(botsByTopic.keys());
+  const minCount = Math.min(...topics.map(t => topicPostCounts.get(t) || 0));
+  const underserved = topics.filter(t => (topicPostCounts.get(t) || 0) === minCount);
 
-    // Bot weight = sum of user interest in bot's topics
-    let weight = 0;
-    for (const topic of persona.topics) {
-      weight += aggregateInterests.get(topic) || 0;
-    }
+  // Round-robin among tied underserved topics
+  const topicIdx = (topicBotIndex.get('_global') || 0) % underserved.length;
+  const chosenTopic = underserved[topicIdx];
+  topicBotIndex.set('_global', (topicBotIndex.get('_global') || 0) + 1);
 
-    return { bot, weight };
-  });
+  // Pick a bot for that topic (round-robin for topics with multiple bots like politics)
+  const botsForTopic = botsByTopic.get(chosenTopic)!;
+  const botIdx = (topicBotIndex.get(chosenTopic) || 0) % botsForTopic.length;
+  topicBotIndex.set(chosenTopic, botIdx + 1);
 
-  // DETERMINISTIC selection: always pick bot with highest weight
-  botWeights.sort((a, b) => b.weight - a.weight);
-  return botWeights[0].bot;
+  topicPostCounts.set(chosenTopic, (topicPostCounts.get(chosenTopic) || 0) + 1);
+  return botsForTopic[botIdx];
 }
 
 // ── Opinionated bot run (post + like) ──────────────────────────────────────
@@ -745,11 +803,13 @@ export async function runBot(): Promise<boolean> {
     // Pick a random template
     const content = persona.templates[Math.floor(Math.random() * persona.templates.length)];
 
-    // Extract hashtags and normalize to canonical topics for demo
+    // Extract hashtags, normalize, deduplicate, and filter to canonical only
     const hashtagMatches = content.match(/#\w+/g) || [];
-    const topicTags = hashtagMatches
-      .map(tag => tag.slice(1).toLowerCase())
-      .map(tag => normalizeToCanonical(tag));
+    const topicTags = [...new Set(
+      hashtagMatches
+        .map(tag => normalizeToCanonical(tag.slice(1).toLowerCase()))
+        .filter(tag => CANONICAL_TOPICS_LIST.includes(tag))
+    )];
 
     // Insert post
     const { error: postError } = await supabase
@@ -848,24 +908,24 @@ let decayInterval: number | null = null;
 export function startBotLoop() {
   if (botInterval) return;
 
-  // Initialize attraction graph from database FIRST
+  // Initialize MUST complete before bots start posting,
+  // otherwise topicPostCounts is empty and balancing is blind.
   initializeAttractionGraph().then(() => {
-    console.log('Attraction graph ready');
+    console.log('Attraction graph ready — starting bot posting');
+
+    // Opinionated bot posting loop (fixed 10s interval for deterministic behavior)
+    const scheduleNext = () => {
+      const delay = 10000; // Fixed interval
+      botInterval = window.setTimeout(async () => {
+        await runBot();
+        scheduleNext();
+      }, delay);
+    };
+
+    runBot().then(scheduleNext);
   });
 
-  if (botInterval) return;
-
-  // Opinionated bot posting loop (fixed 10s interval for deterministic behavior)
-  const scheduleNext = () => {
-    const delay = 10000; // Fixed interval
-    botInterval = window.setTimeout(async () => {
-      await runBot();
-      scheduleNext();
-    }, delay);
-  };
-
-  runBot().then(scheduleNext);
-  console.log('Bot loop started');
+  console.log('Bot loop started (waiting for init...)');
 
   // Cleanup expired drifters immediately and every 10 seconds
   cleanupExpiredDrifters();
@@ -934,5 +994,7 @@ export function stopBotLoop() {
   
   activeDrifters.clear();
   attractionGraph.clear();
+  topicPostCounts.clear();
+  topicBotIndex.clear();
   console.log('Bot loop stopped');
 }

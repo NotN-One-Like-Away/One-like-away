@@ -87,7 +87,9 @@ export function Feed() {
     // Filter: as echo grows, threshold for inclusion rises
     const affinityThreshold = 0.1 + (echoStrength * 0.5);
 
-    const filtered = scoredPosts.filter(({ affinity }) => {
+    const filtered = scoredPosts.filter(({ post, affinity }) => {
+      // Always show the user's own posts
+      if (user && post.user_id === user.id) return true;
       // NO recent post bypass once user has preferences - outcomes based EXCLUSIVELY on likes
       if (likedTopics.size === 0) {
         // No preferences yet - show everything
@@ -334,7 +336,7 @@ export function Feed() {
         ) : (
           <div className="space-y-4">
             {recommendedPosts.map((post) => (
-              <Post key={post.id} post={post} onLikeChange={handleLikeChange} />
+              <Post key={post.id} post={post} isOwnPost={user?.id === post.user_id} onLikeChange={handleLikeChange} />
             ))}
           </div>
         )}
